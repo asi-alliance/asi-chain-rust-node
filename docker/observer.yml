@@ -35,9 +35,9 @@ services:
       - --no-upnp
       - --allow-private-addresses
       - --heartbeat-disabled
-      - --native-token-name=${NATIVE_TOKEN_NAME:-F1R3CAP}
-      - --native-token-symbol=${NATIVE_TOKEN_SYMBOL:-F1R3}
-      - --native-token-decimals=${NATIVE_TOKEN_DECIMALS:-8}
+      - --native-token-name=${NATIVE_TOKEN_NAME:-ASI}
+      - --native-token-symbol=${NATIVE_TOKEN_SYMBOL:-ASI}
+      - --native-token-decimals=${NATIVE_TOKEN_DECIMALS:-18}
     ports:
       - "40450:40400"
       - "40451:40401"

@@ -209,9 +209,9 @@ The native token's identity is configured in `defaults.conf` (or via CLI flags) 
 
 | Config Field | CLI Flag | Default | Description |
 |---|---|---|---|
-| `native-token-name` | `--native-token-name` | `F1R3CAP` | Full display name |
-| `native-token-symbol` | `--native-token-symbol` | `F1R3` | Ticker symbol |
-| `native-token-decimals` | `--native-token-decimals` | `8` | Decimal places (1 token = 10^decimals dust) |
+| `native-token-name` | `--native-token-name` | `ASI` | Full display name |
+| `native-token-symbol` | `--native-token-symbol` | `ASI` | Ticker symbol |
+| `native-token-decimals` | `--native-token-decimals` | `18` | Decimal places (1 token = 10^decimals dust) |
 
 Override per-node via environment variables in the compose files (e.g. `NATIVE_TOKEN_NAME=MyToken`), or per-validator via `VALIDATOR1_NATIVE_TOKEN_NAME=MyToken`.
 

@@ -26,9 +26,9 @@ services:
         --validator-private-key=${STANDALONE_PRIVATE_KEY:?STANDALONE_PRIVATE_KEY
         must be set, copy docker/.env.example to docker/.env}
       - --allow-private-addresses
-      - --native-token-name=${NATIVE_TOKEN_NAME:-F1R3CAP}
-      - --native-token-symbol=${NATIVE_TOKEN_SYMBOL:-F1R3}
-      - --native-token-decimals=${NATIVE_TOKEN_DECIMALS:-8}
+      - --native-token-name=${NATIVE_TOKEN_NAME:-ASI}
+      - --native-token-symbol=${NATIVE_TOKEN_SYMBOL:-ASI}
+      - --native-token-decimals=${NATIVE_TOKEN_DECIMALS:-18}
     ports:
       - "40400:40400"
       - "40401:40401"
