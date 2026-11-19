@@ -85,9 +85,9 @@ services:
       - "2"
       - --ceremony-master-mode
       - --heartbeat-disabled
-      - --native-token-name=${BOOTSTRAP_NATIVE_TOKEN_NAME:-${NATIVE_TOKEN_NAME:-F1R3CAP}}
-      - --native-token-symbol=${BOOTSTRAP_NATIVE_TOKEN_SYMBOL:-${NATIVE_TOKEN_SYMBOL:-F1R3}}
-      - --native-token-decimals=${BOOTSTRAP_NATIVE_TOKEN_DECIMALS:-${NATIVE_TOKEN_DECIMALS:-8}}
+      - --native-token-name=${BOOTSTRAP_NATIVE_TOKEN_NAME:-${NATIVE_TOKEN_NAME:-ASI}}
+      - --native-token-symbol=${BOOTSTRAP_NATIVE_TOKEN_SYMBOL:-${NATIVE_TOKEN_SYMBOL:-ASI}}
+      - --native-token-decimals=${BOOTSTRAP_NATIVE_TOKEN_DECIMALS:-${NATIVE_TOKEN_DECIMALS:-18}}
     ports:
       - "40400:40400"
       - "40401:40401"
@@ -130,9 +130,9 @@ services:
         --validator-private-key=${VALIDATOR1_PRIVATE_KEY:?VALIDATOR1_PRIVATE_KEY
         must be set, copy docker/.env.example to docker/.env}
       - --genesis-validator
-      - --native-token-name=${VALIDATOR1_NATIVE_TOKEN_NAME:-${NATIVE_TOKEN_NAME:-F1R3CAP}}
-      - --native-token-symbol=${VALIDATOR1_NATIVE_TOKEN_SYMBOL:-${NATIVE_TOKEN_SYMBOL:-F1R3}}
-      - --native-token-decimals=${VALIDATOR1_NATIVE_TOKEN_DECIMALS:-${NATIVE_TOKEN_DECIMALS:-8}}
+      - --native-token-name=${VALIDATOR1_NATIVE_TOKEN_NAME:-${NATIVE_TOKEN_NAME:-ASI}}
+      - --native-token-symbol=${VALIDATOR1_NATIVE_TOKEN_SYMBOL:-${NATIVE_TOKEN_SYMBOL:-ASI}}
+      - --native-token-decimals=${VALIDATOR1_NATIVE_TOKEN_DECIMALS:-${NATIVE_TOKEN_DECIMALS:-18}}
     ports:
       - "40410:40400"
       - "40412:40402"
@@ -163,9 +163,9 @@ services:
         --validator-private-key=${VALIDATOR2_PRIVATE_KEY:?VALIDATOR2_PRIVATE_KEY
         must be set, copy docker/.env.example to docker/.env}
       - --genesis-validator
-      - --native-token-name=${VALIDATOR2_NATIVE_TOKEN_NAME:-${NATIVE_TOKEN_NAME:-F1R3CAP}}
-      - --native-token-symbol=${VALIDATOR2_NATIVE_TOKEN_SYMBOL:-${NATIVE_TOKEN_SYMBOL:-F1R3}}
-      - --native-token-decimals=${VALIDATOR2_NATIVE_TOKEN_DECIMALS:-${NATIVE_TOKEN_DECIMALS:-8}}
+      - --native-token-name=${VALIDATOR2_NATIVE_TOKEN_NAME:-${NATIVE_TOKEN_NAME:-ASI}}
+      - --native-token-symbol=${VALIDATOR2_NATIVE_TOKEN_SYMBOL:-${NATIVE_TOKEN_SYMBOL:-ASI}}
+      - --native-token-decimals=${VALIDATOR2_NATIVE_TOKEN_DECIMALS:-${NATIVE_TOKEN_DECIMALS:-18}}
     ports:
       - "40420:40400"
       - "40422:40402"
@@ -196,9 +196,9 @@ services:
         --validator-private-key=${VALIDATOR3_PRIVATE_KEY:?VALIDATOR3_PRIVATE_KEY
         must be set, copy docker/.env.example to docker/.env}
       - --genesis-validator
-      - --native-token-name=${VALIDATOR3_NATIVE_TOKEN_NAME:-${NATIVE_TOKEN_NAME:-F1R3CAP}}
-      - --native-token-symbol=${VALIDATOR3_NATIVE_TOKEN_SYMBOL:-${NATIVE_TOKEN_SYMBOL:-F1R3}}
-      - --native-token-decimals=${VALIDATOR3_NATIVE_TOKEN_DECIMALS:-${NATIVE_TOKEN_DECIMALS:-8}}
+      - --native-token-name=${VALIDATOR3_NATIVE_TOKEN_NAME:-${NATIVE_TOKEN_NAME:-ASI}}
+      - --native-token-symbol=${VALIDATOR3_NATIVE_TOKEN_SYMBOL:-${NATIVE_TOKEN_SYMBOL:-ASI}}
+      - --native-token-decimals=${VALIDATOR3_NATIVE_TOKEN_DECIMALS:-${NATIVE_TOKEN_DECIMALS:-18}}
     ports:
       - "40430:40400"
       - "40432:40402"
@@ -275,9 +275,9 @@ services:
       - --no-upnp
       - --allow-private-addresses
       - --heartbeat-disabled
-      - --native-token-name=${READONLY_NATIVE_TOKEN_NAME:-${NATIVE_TOKEN_NAME:-F1R3CAP}}
-      - --native-token-symbol=${READONLY_NATIVE_TOKEN_SYMBOL:-${NATIVE_TOKEN_SYMBOL:-F1R3}}
-      - --native-token-decimals=${READONLY_NATIVE_TOKEN_DECIMALS:-${NATIVE_TOKEN_DECIMALS:-8}}
+      - --native-token-name=${READONLY_NATIVE_TOKEN_NAME:-${NATIVE_TOKEN_NAME:-ASI}}
+      - --native-token-symbol=${READONLY_NATIVE_TOKEN_SYMBOL:-${NATIVE_TOKEN_SYMBOL:-ASI}}
+      - --native-token-decimals=${READONLY_NATIVE_TOKEN_DECIMALS:-${NATIVE_TOKEN_DECIMALS:-18}}
     ports:
       - "40450:40400"
       - "40451:40401"
