@@ -299,10 +299,17 @@ struct WalkedLineage {
 }
 
 pub(crate) struct Settled {
-    /// The sigs this settle made terminal.
-    pub(crate) terminal: Vec<Bytes>,
+    /// The sigs this settle made terminal, with the record each received.
+    pub(crate) terminal: Vec<(Bytes, TerminalRecord)>,
     /// The lineage blocks this settle walked.
     pub(crate) walked: usize,
+}
+
+#[cfg(test)]
+impl Settled {
+    fn terminal_sigs(&self) -> Vec<Bytes> {
+        self.terminal.iter().map(|(sig, _)| sig.clone()).collect()
+    }
 }
 
 /// The floor of `dag`'s adopted LFB: the position [`settle`] judges against.
@@ -341,7 +348,7 @@ pub(crate) fn settle(
     for (sig, row) in rows {
         let sig = Bytes::from(sig);
         match pass.settle_row(dag, &sig, &row) {
-            Ok(Some(_)) => terminal.push(sig),
+            Ok(Some(record)) => terminal.push((sig, record)),
             Ok(None) => {}
             Err(e) => {
                 metrics::counter!(
@@ -460,13 +467,14 @@ impl SettlePass {
         ))
     }
 
-    /// Writes the verdict this pass decides for one open row, and returns it.
+    /// Writes the verdict this pass decides for one open row, and returns the
+    /// record stored for it.
     fn settle_row(
         &self,
         dag: &KeyValueDagRepresentation,
         sig: &Bytes,
         row: &LifecycleEvents,
-    ) -> Result<Option<TerminalState>, CasperError> {
+    ) -> Result<Option<TerminalRecord>, CasperError> {
         let Some(valid_after) = row.valid_after else {
             dag.discard_lifecycle_events_if(sig, |current| {
                 current.valid_after.is_none() && self.record_only_past_contest(current)
@@ -488,10 +496,9 @@ impl SettlePass {
         } else {
             self.beyond_contest_state(dag, row, valid_after)?
         };
-        if let Some(state) = state {
-            write_terminal(dag, sig, state, row)?;
-        }
-        Ok(state)
+        state
+            .map(|state| write_terminal(dag, sig, state, row))
+            .transpose()
     }
 
     /// Expired or Failed once the basis is past the contestability bound,
@@ -549,7 +556,7 @@ impl SettlePass {
         if *hash == self.basis {
             return Ok(true);
         }
-        let Some(height) = dag.block_number(hash) else {
+        let Some(height) = dag.block_number(hash)? else {
             return Ok(false);
         };
         if height > self.basis_height {
@@ -616,26 +623,26 @@ pub(crate) fn release_settled(
 /// looking for a deploy that is not in it.
 fn frozen_display(
     row: &LifecycleEvents,
-    is_visible: &dyn Fn(&[u8]) -> bool,
-) -> (u32, i64, Vec<u8>) {
+    is_visible: &dyn Fn(&[u8]) -> Result<bool, shared::rust::store::key_value_store::KvStoreError>,
+) -> Result<(u32, i64, Vec<u8>), shared::rust::store::key_value_store::KvStoreError> {
     let rejection_count = row
         .events
         .iter()
         .filter(|e| matches!(e.kind, LifecycleEventKind::Rejected { .. }))
         .count() as u32;
-    let latest = row
-        .events
-        .iter()
-        .filter(|e| matches!(e.kind, LifecycleEventKind::Included { .. }))
-        .filter(|e| is_visible(&e.block_hash))
-        .max_by(|a, b| {
-            a.height
-                .cmp(&b.height)
-                .then_with(|| a.block_hash.cmp(&b.block_hash))
-        })
-        .map(|e| (e.height, e.block_hash.clone()));
+    let mut latest = None;
+    for event in &row.events {
+        if matches!(event.kind, LifecycleEventKind::Included { .. })
+            && is_visible(&event.block_hash)?
+        {
+            let appearance = (event.height, event.block_hash.clone());
+            if latest.as_ref().is_none_or(|current| &appearance > current) {
+                latest = Some(appearance);
+            }
+        }
+    }
     let (latest_height, latest_block_hash) = latest.unwrap_or((0, Vec::new()));
-    (rejection_count, latest_height, latest_block_hash)
+    Ok((rejection_count, latest_height, latest_block_hash))
 }
 
 fn write_terminal(
@@ -643,10 +650,10 @@ fn write_terminal(
     sig: &Bytes,
     state: TerminalState,
     row: &LifecycleEvents,
-) -> Result<(), CasperError> {
+) -> Result<TerminalRecord, CasperError> {
     let (rejection_count, latest_height, latest_block_hash) = frozen_display(row, &|h| {
         dag.contains(&prost::bytes::Bytes::copy_from_slice(h))
-    });
+    })?;
     let written = dag
         .put_deploy_terminal_if_absent(sig, TerminalRecord {
             state,
@@ -662,7 +669,7 @@ fn write_terminal(
         rejection_count = written.rejection_count,
         "deploy lifecycle terminal verdict written"
     );
-    Ok(())
+    Ok(written)
 }
 
 /// Settles with the adopted LFB as the basis, for rules stated relative to
@@ -870,7 +877,7 @@ mod tests {
             &mut LineageMemo::default(),
         )
         .expect("settle at genesis")
-        .terminal;
+        .terminal_sigs();
         assert!(
             terminalized.is_empty(),
             "no verdict may be written off an admitted block's frozen floor \
@@ -900,7 +907,7 @@ mod tests {
             &mut LineageMemo::default(),
         )
         .expect("settle at c's floor")
-        .terminal;
+        .terminal_sigs();
         assert_eq!(
             terminalized,
             vec![sig],
@@ -985,7 +992,7 @@ mod tests {
         let dag = dag_storage.get_representation().expect("dag");
         let early = settle_at_lfb(&dag, &block_store, 1, Some(1), &mut LineageMemo::default())
             .expect("settle at genesis")
-            .terminal;
+            .terminal_sigs();
         assert!(early.is_empty(), "no verdict before a covering adoption");
 
         // Adopt d (height 4): past decide_at = max(window_end, last
@@ -999,7 +1006,7 @@ mod tests {
         let terminalized =
             settle_at_lfb(&dag, &block_store, 1, Some(1), &mut LineageMemo::default())
                 .expect("settle after adoption")
-                .terminal;
+                .terminal_sigs();
 
         assert_eq!(terminalized, vec![sig.clone()]);
         let record = dag
@@ -1042,10 +1049,17 @@ mod tests {
             ],
         };
 
-        let (rejection_count, latest_height, latest_block_hash) = frozen_display(&row, &|_| true);
+        let (rejection_count, latest_height, latest_block_hash) =
+            frozen_display(&row, &|_| Ok(true)).unwrap();
         assert_eq!(rejection_count, 1);
 
-        let (_, orphan_height, orphan_hash) = frozen_display(&row, &|_| false);
+        let (_, orphan_height, orphan_hash) = frozen_display(&row, &|_| Ok(false)).unwrap();
+        assert!(frozen_display(&row, &|_| Err(
+            shared::rust::store::key_value_store::KvStoreError::InvalidArgument(
+                "injected visibility failure".into()
+            )
+        ))
+        .is_err());
         assert_eq!(
             (orphan_height, orphan_hash),
             (0, Vec::new()),
@@ -1248,7 +1262,7 @@ mod tests {
         let mut memo = LineageMemo::default();
         let terminalized = settle_at_lfb(&dag, &block_store, 1, Some(1), &mut memo)
             .expect("a horizon crossing must not error")
-            .terminal;
+            .terminal_sigs();
         assert_eq!(
             terminalized,
             vec![sig_live.clone()],
@@ -1304,7 +1318,7 @@ mod tests {
         let dag = dag_storage.get_representation().expect("dag");
         let terminalized = settle_at_lfb(&dag, &block_store, 1, Some(1), &mut memo)
             .expect("settle at w4")
-            .terminal;
+            .terminal_sigs();
         assert_eq!(terminalized, vec![sig_blocked.clone()]);
         let record = dag
             .deploy_terminal(&sig_blocked)
@@ -1842,7 +1856,7 @@ mod settle_and_release_tests {
             &mut LineageMemo::default(),
         )
         .expect("settle")
-        .terminal;
+        .terminal_sigs();
         assert_eq!(
             terminal,
             vec![sig],
@@ -1912,10 +1926,84 @@ mod settle_and_release_tests {
         let dag = dag_storage.get_representation().expect("dag");
         let terminal = settle_at_lfb(&dag, &block_store, 1, Some(1), &mut LineageMemo::default())
             .expect("settle at #4")
-            .terminal;
+            .terminal_sigs();
         assert!(terminal.is_empty(), "a record-only row is never terminal");
         assert!(!row_open(&dag), "past the bound the row is dropped");
         assert!(dag.deploy_terminal(&sig).expect("lookup").is_none());
+    }
+
+    /// A deploy this node admitted that no block ever carries settles
+    /// Expired once no admissible block can carry it — the same bound an
+    /// included deploy is held to, measured from its window alone.
+    #[tokio::test]
+    async fn an_admitted_deploy_no_block_carries_settles_expired_past_contest() {
+        let mut kvm = InMemoryStoreManager::new();
+        let block_store = KeyValueBlockStore::create_from_kvm(&mut kvm)
+            .await
+            .expect("block store");
+        let dag_storage = BlockDagKeyValueStorage::new(&mut kvm)
+            .await
+            .expect("dag storage");
+
+        let sig = Bytes::from_static(b"admitted-never-included-sig");
+        let mut chain = vec![chain_block(0, None)];
+        for number in 1..=4 {
+            let next = chain_block(number, chain.last());
+            chain.push(next);
+        }
+        for block in &chain {
+            block_store.put_block_message(block).expect("store block");
+        }
+        dag_storage
+            .insert(&chain[0], InsertMode::Approved)
+            .expect("insert genesis");
+        for block in &chain[1..] {
+            dag_storage
+                .insert(block, InsertMode::Normal)
+                .expect("insert block");
+        }
+        dag_storage.record_deploy_admitted(&sig, 1).expect("admit");
+
+        // Window start 1, lifespan 1, bound 1: decidable only past 3.
+        dag_storage
+            .record_directly_finalized(chain[3].block_hash.clone(), 0.5, |_| async { Ok(()) })
+            .await
+            .expect("adopt #3");
+        let dag = dag_storage.get_representation().expect("dag");
+        let early = settle_at_lfb(&dag, &block_store, 1, Some(1), &mut LineageMemo::default())
+            .expect("settle at #3");
+        assert!(
+            early.terminal.is_empty(),
+            "inside the bound the deploy stays Pending"
+        );
+
+        dag_storage
+            .record_directly_finalized(chain[4].block_hash.clone(), 0.5, |_| async { Ok(()) })
+            .await
+            .expect("adopt #4");
+        let dag = dag_storage.get_representation().expect("dag");
+        let settled = settle_at_lfb(&dag, &block_store, 1, Some(1), &mut LineageMemo::default())
+            .expect("settle at #4");
+        assert_eq!(settled.terminal.len(), 1);
+        let (settled_sig, record) = &settled.terminal[0];
+        assert_eq!(settled_sig, &sig);
+        assert_eq!(record.state, TerminalState::Expired);
+        assert!(
+            record.latest_block_hash.is_empty(),
+            "no block carried the deploy, so the verdict names none"
+        );
+        assert_eq!(
+            dag.deploy_terminal(&sig).expect("lookup").map(|t| t.state),
+            Some(TerminalState::Expired)
+        );
+
+        dag_storage
+            .record_deploy_admitted(&sig, 1)
+            .expect("re-admit");
+        assert!(
+            dag.deploy_lifecycle_events(&sig).expect("lookup").is_none(),
+            "admission never reopens a row behind a verdict"
+        );
     }
 
     /// An error deciding one row costs that row only: the other rows still
@@ -1979,7 +2067,7 @@ mod settle_and_release_tests {
 
         let terminal = settle_at_lfb(&dag, &block_store, 1, Some(1), &mut LineageMemo::default())
             .expect("a row error must not fail the settle")
-            .terminal;
+            .terminal_sigs();
         assert_eq!(terminal, vec![clean.sig.clone()]);
         assert_eq!(
             dag.deploy_terminal(&clean.sig)
@@ -2216,7 +2304,7 @@ mod settle_and_release_tests {
         let settled = settle_at_lfb(&dag, &block_store, 50, Some(50), &mut memo)
             .expect("settle at the merge");
         assert_eq!(settled.walked, 3, "merge, b1 and genesis");
-        assert_eq!(settled.terminal, vec![deploy.sig.clone()]);
+        assert_eq!(settled.terminal_sigs(), vec![deploy.sig.clone()]);
         assert_eq!(
             dag.deploy_terminal(&deploy.sig)
                 .expect("lookup")

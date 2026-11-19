@@ -24,14 +24,17 @@ pub struct CasperConf {
 
     #[serde(rename = "casper-loop-interval", deserialize_with = "de_duration")]
     pub casper_loop_interval: Duration,
-    #[serde(rename = "requested-blocks-timeout", deserialize_with = "de_duration")]
-    pub requested_blocks_timeout: Duration,
     #[serde(rename = "finalization-rate")]
     pub finalization_rate: i32,
     #[serde(rename = "max-number-of-parents")]
     pub max_number_of_parents: i32,
     #[serde(rename = "max-parent-depth")]
     pub max_parent_depth: i32,
+    #[serde(
+        rename = "dag-hot-window-depth",
+        default = "default_dag_hot_window_depth"
+    )]
+    pub dag_hot_window_depth: i64,
     /// Deploy validity window in blocks. Consensus-bearing (expiry and
     /// repeat-deploy validity rules read it), so the genesis value is baked
     /// into the PoS contract and adopted from chain at startup.
@@ -111,6 +114,9 @@ pub struct CasperConf {
     )]
     pub max_user_deploys_per_block: u32,
 
+    #[serde(rename = "deploy-admission", default)]
+    pub deploy_admission: block_storage::rust::deploy::key_value_deploy_storage::DeployPoolLimits,
+
     /// Enable background garbage collection for mergeable channels.
     /// When enabled, uses safe reachability-based GC (required for multi-parent mode).
     /// When disabled (default), mergeable data is retained.
@@ -136,6 +142,33 @@ pub struct CasperConf {
         default = "default_mergeable_channels_gc_depth_buffer"
     )]
     pub mergeable_channels_gc_depth_buffer: i32,
+
+    /// Delete finalized block bodies from the block store once no honest
+    /// validator can still cite them. Piggybacks on the mergeable-channels
+    /// GC pass: a block is deleted at the same horizon
+    /// (`floor.block_number - block.block_number > max-parent-depth +
+    /// mergeable-channels-gc-depth-buffer`, and every active validator has
+    /// moved past it). Requires `enable-mergeable-channel-gc` to be on.
+    #[serde(
+        rename = "enable-block-store-gc",
+        default = "default_enable_block_store_gc"
+    )]
+    pub enable_block_store_gc: bool,
+
+    /// Mark-and-sweep the `rspace/history` radix-trie LMDB env, deleting
+    /// nodes no retained state root can reach (issue #923, Option D).
+    /// Shipped default off: first release of trie-store-mutating code.
+    /// LMDB file does not shrink when enabled — reclaimed pages are
+    /// reused by future writes; an offline compaction tool would be
+    /// needed to reduce the on-disk footprint. Requires
+    /// `enable-mergeable-channel-gc` for cadence (sweep runs on the same
+    /// loop tick), but deletion is independent and does not require
+    /// `enable-block-store-gc`.
+    #[serde(
+        rename = "enable-history-pruning",
+        default = "default_enable_history_pruning"
+    )]
+    pub enable_history_pruning: bool,
 }
 
 fn default_deploy_play_budget() -> Duration { Duration::ZERO }
@@ -164,6 +197,18 @@ fn default_mergeable_channels_gc_interval() -> Duration {
 }
 
 fn default_mergeable_channels_gc_depth_buffer() -> i32 { 10 }
+
+/// Matches the shipped defaults.conf value: a sparse operator conf that
+/// omits the key must not silently disable block-store GC. Public so the
+/// node's config tests pin shipped-vs-fallback agreement.
+pub fn default_enable_block_store_gc() -> bool { true }
+
+/// Default off for the first release. Flip on after a soak run confirms
+/// no `UnknownRootError` regressions. Public so the node's config tests
+/// pin shipped-vs-fallback agreement.
+pub fn default_enable_history_pruning() -> bool { false }
+
+fn default_dag_hot_window_depth() -> i64 { 1024 }
 
 /// Round robin dispatcher configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

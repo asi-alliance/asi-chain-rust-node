@@ -60,7 +60,6 @@ use std::sync::Arc;
 use block_storage::rust::dag::block_dag_key_value_storage::BlockDagKeyValueStorage;
 use block_storage::rust::deploy::key_value_deploy_storage::KeyValueDeployStorage;
 use block_storage::rust::key_value_block_store::KeyValueBlockStore;
-use comm::rust::transport::transport_layer::TransportLayer;
 use models::rust::block_hash::BlockHash;
 use models::rust::casper::pretty_printer::PrettyPrinter;
 use models::rust::casper::protocol::casper_message::BlockMessage;
@@ -478,6 +477,7 @@ fn settle_blocking(
             settle_ms,
             "deploy-lifecycle settle"
         );
+        publish_verdicts(&ctx.event_publisher, &settled.terminal);
     }
     let prune_ms = if advanced {
         let prune_started = std::time::Instant::now();
@@ -492,6 +492,43 @@ fn settle_blocking(
     record_settle_timing(settle_ms, prune_ms);
     release_settled(&dag, &ctx.deploy_storage)?;
     settled.map(|_| ())
+}
+
+fn publish_verdicts(
+    event_publisher: &F1r3flyEvents,
+    terminal: &[(
+        prost::bytes::Bytes,
+        block_storage::rust::dag::deploy_lifecycle_types::TerminalRecord,
+    )],
+) {
+    use block_storage::rust::dag::deploy_lifecycle_types::TerminalState;
+    use shared::rust::shared::f1r3fly_event::{DeployVerdict, DeployVerdictState, F1r3flyEvent};
+
+    if terminal.is_empty() {
+        return;
+    }
+    let verdicts = terminal
+        .iter()
+        .map(|(sig, record)| DeployVerdict {
+            deploy_id: hex::encode(sig),
+            state: match record.state {
+                TerminalState::Finalized => DeployVerdictState::Finalized,
+                TerminalState::Expired => DeployVerdictState::Expired,
+                TerminalState::Failed => DeployVerdictState::Failed,
+            },
+            rejection_count: record.rejection_count,
+            block_hash: (!record.latest_block_hash.is_empty())
+                .then(|| hex::encode(&record.latest_block_hash)),
+        })
+        .collect();
+    if let Err(error) = event_publisher.publish(F1r3flyEvent::deploy_verdicts(verdicts)) {
+        tracing::error!(
+            target: "f1r3fly.casper.lifecycle",
+            verdicts = terminal.len(),
+            error = %error,
+            "deploy verdicts event was not published"
+        );
+    }
 }
 
 /// One LFB decision and, on an advance, its finalization effects. Returns
@@ -747,7 +784,7 @@ pub(crate) fn read_last_finalized_block(
     })
 }
 
-impl<T: TransportLayer + Send + Sync> MultiParentCasperImpl<T> {
+impl MultiParentCasperImpl {
     /// Waits for a finalizer cycle that started after this call to complete,
     /// and returns the LFB it leaves.
     pub async fn finalize(&self) -> Result<BlockMessage, CasperError> {
@@ -759,13 +796,13 @@ impl<T: TransportLayer + Send + Sync> MultiParentCasperImpl<T> {
 /// Trigger a finalization run if the new block crosses the finalization
 /// rate boundary. Free function (matches the rest of `engine/multi_parent_casper/*`
 /// module idiom — every other operation in this sub-module is a free
-/// function taking `this: &MultiParentCasperImpl<T>`).
+/// function taking `this: &MultiParentCasperImpl`).
 ///
 /// Promoted from inherent `impl` block during the engine::multi_parent_casper
 /// refactor (Phase-3+ cleanup). Caller:
 /// `block_admission::admit_handle_valid_block`.
-pub(crate) async fn update_last_finalized_block<T: TransportLayer + Send + Sync>(
-    this: &MultiParentCasperImpl<T>,
+pub(crate) async fn update_last_finalized_block(
+    this: &MultiParentCasperImpl,
     new_block: &BlockMessage,
 ) -> Result<(), CasperError> {
     if this.casper_shard_conf.finalization_rate <= 0 {

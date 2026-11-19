@@ -1,10 +1,10 @@
-> Last updated: 2026-04-19
+> Last updated: 2026-11-10
 
 # Crate: block-storage
 
 **Path**: `block-storage/`
 
-Block persistence, DAG state management, casper buffer, and deploy indexing.
+Block persistence, DAG state management, pending blocks, and deploy indexing.
 
 ## Block Store
 
@@ -16,46 +16,71 @@ Block persistence, DAG state management, casper buffer, and deploy indexing.
 
 ## DAG Storage
 
-**`KeyValueDagRepresentation`** -- Immutable DAG snapshot (O(1) clones via `imbl`):
-- `dag_set`, `latest_messages_map`, `child_map`, `height_map`
-- `invalid_blocks_set`, `last_finalized_block`, `finalized_blocks_set`
-- Queries: `lookup`, `children`, `parents_unsafe`, `latest_messages`, `topo_sort`, `main_parent_chain`, `ancestors`, `descendants`, `non_finalized_blocks`
+**Configuration and resident state.** `casper.dag-hot-window-depth` must be positive and defaults to `1024`.
+For finalized height `F`, window depth `W`, and maximum published valid height `H`, the resident band is inclusive: `max(0, F-W)..H`.
+Invalid blocks cannot raise `H`.
+The window bounds retained history by height, not by block count.
+Unfinalized blocks above `F` remain resident through `H`.
+Eviction removes resident indices without deleting cold metadata, membership, height, or child records from durable storage.
 
-**`BlockDagKeyValueStorage`** -- Live mutable DAG with global `Mutex`:
-- `get_representation()` -- Atomic snapshot (acquires lock)
-- `insert(block, invalid, approved)` -- Add block with metadata updates
-- `record_directly_finalized(hash, ft_value, effect)` -- Async finalization with cached FT
-- `propagate_ft_to_finalized_blocks(ft_value)` -- Update all finalized blocks with lower cached FT
+**`KeyValueDagRepresentation`.** `get_representation()` captures resident collections, latest messages, the last finalized block, maximum valid height, and publication sequence under a shared lock.
+Clones share the persistent `imbl` collections.
+Historical queries use durable indices and the captured publication sequence, so later block insertions remain invisible to an older view.
+Queries read mutable finality metadata from storage.
+The representation does not capture a historical snapshot of every metadata field.
 
-**`BlockMetadataStore`** -- Per-block metadata with in-memory DAG state:
-- Uses `imbl` persistent collections (HashSet, OrdMap, HashMap) for structural sharing
-- `add(metadata)`, `record_finalized(directly, indirectly, ft_value)`, `contains(hash)`
-- `update_ft_if_higher(hashes, ft_value)` -- Batch update cached FT for blocks below threshold
-- `finalized_block_hashes()` -- Returns all finalized block hashes from in-memory set
-- **DAG metadata caches**: In-memory indices avoid repeated LMDB deserialization on hot paths:
-  - `block_number_map`: BlockHash → block_num
-  - `main_parent_map`: BlockHash → parent BlockHash
-  - `self_justification_map`: BlockHash → justification BlockHash
-  - `finalized_block_set`: Bounded HashSet (cap 50k, prunes to 25k) of finalized blocks
+**Query contract.** `lookup`, `contains`, `children`, `block_number`, `main_parent`, `is_finalized`, and historical traversals return `Result` values.
+Cold records remain queryable after eviction, and storage failures propagate instead of becoming missing blocks or partial traversal results.
+`scan_membership_page` and `scan_height_range` provide paged historical access within the captured visibility boundary.
+Resident map sizes do not describe total DAG history.
 
-## Casper Buffer
+**Publication and finalization.** `BlockDagKeyValueStorage` coordinates readers and writers with a `parking_lot::RwLock`.
+`insert(block, mode)` persists metadata, history indices, applicable latest-message pointers, and publication progress in one atomic transaction before publishing resident state.
+`record_directly_finalized(hash, ft_value, effect)` persists finality metadata and finalized progress before refreshing the resident window.
+`BlockMetadataStore` maintains resident block numbers, main parents, self-justifications, adjacency, and finalized-status caches over durable metadata.
 
-**`CasperBufferKeyValueStorage`** -- Tracks unprocessed block dependencies:
-- Two `DashMap`s: child_to_parent, parent_to_child adjacency lists
-- `BlockDependencyDag` (doubly-linked DAG) rebuilt from persistent store on startup
-- `add_relation(parent, child)`, `put_pendant(block)`, `remove(hash)`, `get_pendants()`
+**Durable tables.** Five databases in the `dagstorage` environment back history outside the window: `dag-membership-v1` (hash to publication sequence, height and invalid flag), `dag-height-v1` (height order), `dag-children-v1` (reverse edges), `dag-history-state-v1` (publication progress and GC discovery state), and `dag-gc-retry-v1` (mergeable-channel GC candidates not yet deletable).
+They share one environment so a publication or finalization is one transaction.
 
-## Finality Storage
+**Restart.** Startup checks committed table counts and the persisted last finalized block against metadata, then rebuilds only the resident band through paged height scans.
+Metadata written without these tables is refused with an instruction to wipe the node's data directory.
 
-**`LastFinalizedStorage` trait**: `put(hash)`, `get()`, `get_or_else(default)`
-- `LastFinalizedKeyValueStorage` (persistent)
-- `LastFinalizedMemoryStorage` (in-memory)
+**Fault tolerance and invalid blocks.** Propagating a higher fault tolerance updates only the finalized blocks still resident; evicted blocks keep their stored value.
+Each representation still loads the `invalid-blocks` table for slash evidence.
+
+**Mergeable-channel GC.** Discovery progress and the queue of candidates not yet deletable are durable.
+The walk that proves every validator has moved past a candidate is rebuilt in memory for each pass, and a storage read error fails the pass rather than deleting anything.
+
+**Diagnostics and test access.** `resident_counts()` reports resident cache cardinalities.
+Production callers use query methods rather than resident maps, whose visibility is restricted to the crate.
+`DagFixture`, `detached_fixture()`, and `fixture_mut()` require tests or the `test-internals` feature.
+Fixture mutation requires a detached view and cannot modify a view backed by durable publication.
+
+**Tests.** `bounded_dag_test`, `dag_window_parity_test` (every accessor agrees with an unbounded DAG below the window) and `dag_memory_bound_test` (live heap stays bounded with the window on; the unbounded baseline is ignored by default).
+
+## Pending Blocks
+
+**`PendingBlocks`** -- Holds blocks in memory until their sender's authorization is known. `KeyValueBlockStore` owns it and reads fall back to it, so `get` and `contains` also see pending blocks.
+- Limits: 8,192 blocks, 256 MiB, and 2,048 blocks for each sender.
+- A requested block is refused only at a limit. Any other block is refused above 90 percent of a limit.
+- The area never evicts. Block ingest decides what leaves. `usage()` reports the totals and the limits.
+
+**`BlockDagKeyValueStorage::set_insert_observer`** reports each block that the DAG inserts. Block ingest uses it to release the blocks that wait on the inserted block.
 
 ## Deploy Storage
 
 **`KeyValueDeployStorage`** -- Stores `Signed<DeployData>` indexed by deploy signature. Methods: `add()`, `remove()`, `read_all()`, `any()`, `non_empty()`. Deploy index maps deploy signature to block hash.
 
 **`KeyValueRejectedDeployBuffer`** -- Keeps deploys that a multi-parent merge rejected, so that this node can propose them again. It uses the same record format as `KeyValueDeployStorage`.
+
+### Name-seed claims
+
+Each store keeps a claim per name seed in `deploy_storage_seeds` or `rejected_deploy_buffer_seeds`: the signature of the deploy that holds the seed.
+
+- **Checked insert.** `add_prepared_if_unchanged`, which admission uses, checks the pool limits, then claims the seed before it writes the record. If another signature holds the seed, it writes nothing and returns `SeedHeld` with that signature. A deploy refused by the pool limits claims nothing.
+- **Other inserts.** `add`, `add_prepared` and `add_prepared_if_absent` store every deploy. They claim the seed when it is free.
+- **Removal.** `remove` and `remove_by_sig` release the claim after they delete the record. An unreadable record's claim stays.
+- **Store open.** The store drops each claim whose signature has no readable record. Such a claim remains after a crash between the claim and the record write.
 
 ### Invalid records in the local deploy stores
 
@@ -72,8 +97,8 @@ The local deploy stores, `deploy_storage` and `rejected_deploy_buffer`, quaranti
 - **Older binaries.** Earlier binaries cannot read version 2 records. A rollback requires compatible decoding or an explicit data conversion. Existing verification-index files are unused and are not deleted automatically.
 - **Key collisions.** The node never overwrites a quarantined record. If a damaged live record has a key that the quarantine already holds with different bytes, the live record stays in place and each scan skips it with a warning.
 - **Interrupted move.** A move writes to the quarantine first and then deletes the live record. If the process stops between the two steps, the record is in both databases. The next scan finds identical bytes in the quarantine and completes the delete.
-- **Concurrent access.** A quarantine move preserves bytes before an atomic compare-and-delete of the live record. A concurrent replacement remains available for subsequent verification. The deploy pool needs no outer mutex.
-- **Admission and recovery.** Admission prepares the candidate once before retries and before acquiring the rejected-buffer mutex. Under that mutex, admission compares current bytes with inspected snapshots and uses conditional insertion. A changed record requires a new inspection outside the mutex. Recovery skips invalid candidates and writes the remaining records in one batch. The `buffer_added` event follows successful persistence.
+- **Concurrent access.** A quarantine move preserves bytes before an atomic compare-and-delete of the live record. A concurrent replacement remains available for subsequent verification. The move holds the store's totals lock across the delete, so it releases the charge of the removed record only.
+- **Admission and recovery.** Admission refuses a deploy whose name seed another signature holds in a block (seed carrier index), in the rejected buffer, or in the pool. Admission prepares the candidate once before retries and before acquiring the rejected-buffer mutex. Under that mutex, admission compares current bytes with inspected snapshots and uses conditional insertion. A changed record requires a new inspection outside the mutex. Admission checks the [pool limits](../designs/deploy-admission.md#pool-limits) and inserts under the store's totals lock. Recovery skips invalid candidates and writes the remaining records in one batch. The `buffer_added` event follows successful persistence.
 - **Operator cleanup.** The `WARN` lines and the counters below show when records enter the quarantine. The quarantine databases hold only records that the node does not read. If you do not need a quarantined record, you can delete it from its quarantine database while the node is stopped. Do not delete records from `deploy_storage` or `rejected_deploy_buffer`.
 - **Diagnostics.** Record warnings identify the store and failure reason: `decode`, `checksum`, or `signature`. They include at most 32 key bytes, byte lengths, and 160 error characters. They exclude deploy contents and private keys. A scan logs at most 10 records, then a summary when needed. Store open reports restoration, duplicate removal, conflicts, and remaining quarantined records.
 - **Counters.** Both quarantine counters have a `store` label. `deploy_store.quarantined_records` also has a `reason` label.
@@ -81,11 +106,11 @@ The local deploy stores, `deploy_storage` and `rejected_deploy_buffer`, quaranti
 
 **`KeyValueRejectedDeployBuffer`** uses the `KeyValueDeployStore` implementation in a separate LMDB store. The buffer holds deploys that a merge rejected and that this validator proposes again. The buffer has no size limit. Each block removes entries whose validity window closed or that expired.
 
-The two stores share the `deploystorage` LMDB environment with a map size of 1 GB. The `deploy.store.size` gauge uses the `store` label and shows the number of entries at the last full read. The node logs a warning when the rejected deploy buffer holds more than 1,000 entries.
+The two stores share the `deploystorage` LMDB environment with a map size of 1 GB. The `deploy.store.size` and `deploy.store.bytes` gauges use the `store` label and show the number of stored records and their encoded bytes after each change. The first write or limit check after the store opens counts the stored records once. The node logs a warning when the rejected deploy buffer holds more than 1,000 entries.
 
 ## Tests
 
-`block_dag_storage_test.rs` (proptest integration), `key_value_block_store.rs` (proptest unit), `casper_buffer_key_value_storage.rs` (tokio async), `doubly_linked_dag_operations.rs` (DAG unit tests).
+`block_dag_storage_test.rs` (proptest integration), `key_value_block_store.rs` (proptest unit), `pending_blocks.rs` (admission class and limits), `doubly_linked_dag_operations.rs` (DAG unit tests).
 
 **See also:** [block-storage/ crate](../../block-storage/)
 

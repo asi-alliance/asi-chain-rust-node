@@ -105,7 +105,7 @@ fn deploy_is_block_expired(
     latest_block_number: i64,
     deploy_lifespan: i64,
 ) -> Result<bool, CasperError> {
-    Ok(!crate::rust::util::deploy_window::is_open(
+    Ok(!models::rust::deploy_window::is_open(
         valid_after_block_number,
         latest_block_number,
         deploy_lifespan,
@@ -184,6 +184,40 @@ impl std::fmt::Display for BlockNotFoundError {
 }
 
 impl std::error::Error for BlockNotFoundError {}
+
+/// The block was once held by this node but has been deleted by the
+/// retention sweep. The DAG still carries its metadata (hash, parents,
+/// height) so we can report the height at which it lived, and the
+/// current prune floor so consumers can decide whether to ask an
+/// archive node. Distinct from [`BlockNotFoundError`], which means
+/// "we have no record of this hash at all" — a joiner that hasn't
+/// caught up yet, or an outright invalid hash. #923 Option D callers
+/// use this split so a client walking `/reporting/trace` can tell
+/// deleted history from a gap and route accordingly.
+#[derive(Debug)]
+pub struct BlockPrunedError {
+    pub hash: String,
+    /// Height of the block when it was retained. Known from the DAG
+    /// metadata index, which is not swept.
+    pub block_height: i64,
+    /// The node's current body-prune floor: the highest height for
+    /// which block bodies have been deleted. Callers can request the
+    /// same hash from an archive node with retention above this.
+    pub prune_floor: i64,
+}
+
+impl std::fmt::Display for BlockPrunedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Block {} (height {}) is below this node's prune floor (height {}). \
+             Consult an archive node to retrieve it.",
+            self.hash, self.block_height, self.prune_floor
+        )
+    }
+}
+
+impl std::error::Error for BlockPrunedError {}
 
 #[derive(Debug)]
 pub struct InvalidHashError(pub String);
@@ -381,6 +415,37 @@ impl std::fmt::Display for DeployValidationError {
 
 impl std::error::Error for DeployValidationError {}
 
+/// A deploy whose block window or expiration timestamp has closed: no block
+/// can include it any more.
+#[derive(Debug)]
+pub struct DeployExpiredError {
+    pub message: String,
+}
+
+impl std::fmt::Display for DeployExpiredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for DeployExpiredError {}
+
+/// The node's own validator is not bonded, so it cannot propose a block for
+/// the deploy now. It may be bonded later.
+#[derive(Debug)]
+pub struct ValidatorNotBondedError;
+
+impl std::fmt::Display for ValidatorNotBondedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "validator_not_bonded: Deploy was rejected because node's validator is not bonded."
+        )
+    }
+}
+
+impl std::error::Error for ValidatorNotBondedError {}
+
 #[derive(Debug)]
 pub struct ProposeReadOnlyError;
 
@@ -405,6 +470,71 @@ impl std::fmt::Display for NoNewDeploysError {
 }
 
 impl std::error::Error for NoNewDeploysError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposeRefusal {
+    NotBonded,
+    NotEnoughNewBlocks,
+    TooFarAheadOfLastFinalized,
+    HistoryIncomplete,
+    MissingBlock,
+    FloorDistanceHold,
+}
+
+impl ProposeRefusal {
+    pub fn from_failure(failure: &ProposeFailure) -> Option<Self> {
+        match failure {
+            ProposeFailure::CheckConstraintsFailure(check) => Some(match check {
+                CheckProposeConstraintsFailure::NotBonded => ProposeRefusal::NotBonded,
+                CheckProposeConstraintsFailure::NotEnoughNewBlocks => {
+                    ProposeRefusal::NotEnoughNewBlocks
+                }
+                CheckProposeConstraintsFailure::TooFarAheadOfLastFinalized => {
+                    ProposeRefusal::TooFarAheadOfLastFinalized
+                }
+                CheckProposeConstraintsFailure::HistoryIncomplete => {
+                    ProposeRefusal::HistoryIncomplete
+                }
+            }),
+            ProposeFailure::MissingBlock(_) => Some(ProposeRefusal::MissingBlock),
+            ProposeFailure::FloorDistanceHold => Some(ProposeRefusal::FloorDistanceHold),
+            ProposeFailure::NoNewDeploys
+            | ProposeFailure::InternalDeployError
+            | ProposeFailure::BugError => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ProposeRefusedError {
+    pub refusal: ProposeRefusal,
+    pub message: String,
+}
+
+impl std::fmt::Display for ProposeRefusedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ProposeRefusedError {}
+
+fn propose_failure_error(status: &ProposeStatus, seq_number: i32) -> eyre::Report {
+    let refusal = match status {
+        ProposeStatus::Failure(ProposeFailure::NoNewDeploys) => {
+            tracing::debug!("Propose: no new deploys (seqNum {})", seq_number);
+            return eyre::Report::new(NoNewDeploysError);
+        }
+        ProposeStatus::Failure(failure) => ProposeRefusal::from_failure(failure),
+        ProposeStatus::Success(_) => None,
+    };
+    let message = format!("Failure: {} (seqNum {})", status, seq_number);
+    tracing::debug!("{}", message);
+    match refusal {
+        Some(refusal) => eyre::Report::new(ProposeRefusedError { refusal, message }),
+        None => eyre::eyre!("{}", message),
+    }
+}
 
 impl BlockAPI {
     fn find_deploy_scan_depth() -> usize { 128 }
@@ -620,26 +750,23 @@ impl BlockAPI {
                 } else {
                     Ok(())
                 }
-            })
-            .and_then(|_| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                if d.data.is_expired_at(now) {
-                    Err(DeployValidationError {
-                        message: format!(
-                            "Deploy has expired: expirationTimestamp={:?} is in the past.",
-                            d.data.expiration_timestamp
-                        ),
-                    })
-                } else {
-                    Ok(())
-                }
             });
 
         // Return early if validation fails
         validation_result.map_err(|e| eyre::Report::new(e))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| eyre::eyre!("system clock is before the Unix epoch: {}", e))?
+            .as_millis() as i64;
+        if d.data.is_expired_at(now) {
+            return Err(eyre::Report::new(DeployExpiredError {
+                message: format!(
+                    "deploy_expired: expirationTimestamp={:?} is in the past.",
+                    d.data.expiration_timestamp
+                ),
+            }));
+        }
 
         let log_error_message =
             "Error: Could not deploy, casper instance was not available yet.".to_string();
@@ -666,34 +793,33 @@ impl BlockAPI {
             }
             let dag = casper.block_dag().await?;
             if !casper.is_local_validator_bonded() {
-                return Err(eyre::Report::new(DeployValidationError {
-                    message: "Deploy was rejected because node's validator is not bonded."
-                        .to_string(),
-                }));
+                return Err(eyre::Report::new(ValidatorNotBondedError));
             }
-            // A deploy admitted now can only ever land in a block that doesn't
-            // exist yet — the next one, at `latest_block_number + 1` — never
-            // in the current tip, which is already built. block_creator.rs's
-            // own expiry filter checks against exactly that next block's
-            // number (`earliest_block_number = block_number - deploy_lifespan`
-            // for the block being assembled). Checking admission against
-            // `latest_block_number` instead of `latest_block_number + 1` is
-            // off by one: a deploy admitted "just inside" the window at the
-            // current tip is then found expired by the very next block's
-            // filter, so it can never actually be included.
-            let next_block_number = dag.latest_block_number() + 1;
+            // `latest_block_number` is the highest stored block number plus
+            // one, which is the number of the next block that block_creator.rs
+            // assembles and checks with its own expiry filter.
+            let next_block_number = dag.latest_block_number();
             let deploy_lifespan = casper.casper_shard_conf().deploy_lifespan;
             if deploy_is_block_expired(
                 d.data.valid_after_block_number,
                 next_block_number,
                 deploy_lifespan,
             )? {
-                return Err(eyre::Report::new(DeployValidationError {
+                return Err(eyre::Report::new(DeployExpiredError {
                     message: format!(
-                        "Deploy validAfterBlockNumber {} has expired at block {} with deploy lifespan {}.",
+                        "deploy_expired: validAfterBlockNumber {} has expired at block {} with deploy lifespan {}.",
                         d.data.valid_after_block_number, next_block_number, deploy_lifespan
                     ),
                 }));
+            }
+            if models::rust::deploy_window::is_too_far_ahead(
+                d.data.valid_after_block_number,
+                next_block_number,
+                casper.casper_shard_conf().max_parent_depth,
+            ) {
+                return Err(eyre::Report::new(
+                    crate::rust::casper::DeployError::InvalidFreshness,
+                ));
             }
             casper_deploy(casper, d, trigger_propose).await
         } else {
@@ -734,13 +860,9 @@ impl BlockAPI {
 
             let r: ApiErr<String> = match proposer_result {
                 ProposerResult::Empty => log_debug("Failure: another propose is in progress"),
-                ProposerResult::Failure(ref status, seq_number) => match status {
-                    ProposeStatus::Failure(ProposeFailure::NoNewDeploys) => {
-                        tracing::debug!("Propose: no new deploys (seqNum {})", seq_number);
-                        Err(eyre::Report::new(NoNewDeploysError))
-                    }
-                    _ => log_debug(&format!("Failure: {} (seqNum {})", status, seq_number)),
-                },
+                ProposerResult::Failure(ref status, seq_number) => {
+                    Err(propose_failure_error(status, seq_number))
+                }
                 ProposerResult::Started(seq_number) => {
                     log_success(&format!("Propose started (seqNum {})", seq_number))
                 }
@@ -1549,14 +1671,40 @@ impl BlockAPI {
                 find_block.await
             };
 
-            let block = block_f?.ok_or_else(|| {
-                eyre::Report::new(BlockNotFoundError {
-                    hash: hash.to_string(),
-                })
-            })?;
+            let block = match block_f? {
+                Some(block) => block,
+                None => {
+                    // The body is missing. Distinguish "was it ever here"
+                    // (BlockNotFoundError) from "we had it, the retention
+                    // sweep deleted it" (BlockPrunedError). The DAG metadata
+                    // index is not swept by #1010 / #1045, so its presence
+                    // of the hash tells us we knew the block once.
+                    let dag = casper.block_dag().await?;
+                    let padded_hash = pad_hex_string(hash);
+                    let hash_bytes = hex::decode(&padded_hash).map_err(|_| {
+                        eyre::Report::new(InvalidHashError(format!(
+                            "'{}' is not valid block hash",
+                            hash
+                        )))
+                    })?;
+                    let dag_hash: prost::bytes::Bytes = hash_bytes.into();
+                    return Err(match dag.lookup(&dag_hash)? {
+                        Some(metadata) => eyre::Report::new(BlockPrunedError {
+                            hash: hash.to_string(),
+                            block_height: metadata.block_number,
+                            prune_floor: casper
+                                .effective_anchor_handle()
+                                .load(std::sync::atomic::Ordering::Acquire),
+                        }),
+                        None => eyre::Report::new(BlockNotFoundError {
+                            hash: hash.to_string(),
+                        }),
+                    });
+                }
+            };
 
             let dag = casper.block_dag().await?;
-            if dag.contains(&block.block_hash) {
+            if dag.contains(&block.block_hash)? {
                 let block_info = BlockAPI::get_full_block_info(casper, &block).await?;
                 Ok(block_info)
             } else {
@@ -1582,10 +1730,10 @@ impl BlockAPI {
         block: &BlockMessage,
         constructor: fn(&BlockMessage, f32, bool) -> A,
     ) -> ApiErr<A> {
-        let is_finalized = dag.is_finalized(&block.block_hash);
+        let is_finalized = dag.is_finalized(&block.block_hash)?;
 
         let normalized_fault_tolerance = if is_finalized {
-            if let Ok(Some(meta)) = dag.lookup(&block.block_hash) {
+            if let Some(meta) = dag.lookup(&block.block_hash)? {
                 meta.fault_tolerance_value
             } else {
                 Self::fault_tolerance_or_unknown(dag, &block.block_hash).await?
@@ -1732,9 +1880,14 @@ impl BlockAPI {
     pub fn preview_private_names(
         deployer: &ByteString,
         timestamp: i64,
+        valid_after_block_number: i64,
         name_qty: i32,
     ) -> ApiErr<Vec<ByteString>> {
-        let mut rand = Tools::unforgeable_name_rng(&PublicKey::from_bytes(deployer), timestamp);
+        let mut rand = Tools::unforgeable_name_rng(
+            &PublicKey::from_bytes(deployer),
+            timestamp,
+            valid_after_block_number,
+        );
         let safe_qty = name_qty.clamp(0, 1024) as usize;
         let ids: Vec<BlockHash> = (0..safe_qty)
             .map(|_| rand.next().into_iter().map(|b| b as u8).collect())
@@ -1785,7 +1938,7 @@ impl BlockAPI {
                     hash
                 )))
             })?;
-            let result = dag.is_finalized(&given_block_hash.into());
+            let result = dag.is_finalized(&given_block_hash.into())?;
             Ok(result)
         } else {
             tracing::warn!("{}", error_message);
@@ -2136,11 +2289,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use prost::bytes::Bytes;
     use tokio::sync::Semaphore;
 
     use super::{
-        await_exploratory_deploy_task, deploy_is_block_expired, ExploratoryDeployOutcome,
-        ExploratoryDeployTaskError,
+        await_exploratory_deploy_task, deploy_is_block_expired, propose_failure_error,
+        ExploratoryDeployOutcome, ExploratoryDeployTaskError, NoNewDeploysError, ProposeRefusal,
+        ProposeRefusedError,
+    };
+    use crate::rust::blocks::proposer::propose_result::{
+        CheckProposeConstraintsFailure, ProposeFailure, ProposeStatus,
     };
 
     struct DropSignal(Arc<AtomicBool>);
@@ -2179,5 +2337,72 @@ mod tests {
         assert!(deploy_is_block_expired(0, 50, 50).unwrap());
         assert!(!deploy_is_block_expired(1, 50, 50).unwrap());
         assert!(!deploy_is_block_expired(0, 49, 50).unwrap());
+    }
+
+    #[test]
+    fn expected_propose_refusals_are_typed() {
+        let cases = vec![
+            (
+                ProposeFailure::CheckConstraintsFailure(CheckProposeConstraintsFailure::NotBonded),
+                ProposeRefusal::NotBonded,
+                "Failure: Proposal failed: validator is not bonded (seqNum 7)",
+            ),
+            (
+                ProposeFailure::CheckConstraintsFailure(
+                    CheckProposeConstraintsFailure::NotEnoughNewBlocks,
+                ),
+                ProposeRefusal::NotEnoughNewBlocks,
+                "Failure: Proposal failed: Must wait for more blocks from other validators (seqNum 7)",
+            ),
+            (
+                ProposeFailure::CheckConstraintsFailure(
+                    CheckProposeConstraintsFailure::TooFarAheadOfLastFinalized,
+                ),
+                ProposeRefusal::TooFarAheadOfLastFinalized,
+                "Failure: Proposal failed: too far ahead of the last finalized block (seqNum 7)",
+            ),
+            (
+                ProposeFailure::CheckConstraintsFailure(
+                    CheckProposeConstraintsFailure::HistoryIncomplete,
+                ),
+                ProposeRefusal::HistoryIncomplete,
+                "Failure: Proposal failed: this node's history does not reach far enough to build a snapshot; it is still catching up (seqNum 7)",
+            ),
+            (
+                ProposeFailure::MissingBlock(Bytes::from_static(&[0xab; 32])),
+                ProposeRefusal::MissingBlock,
+                "Failure: Proposal failed: MissingBlock abababababababab — requested from peers, retrying (seqNum 7)",
+            ),
+            (
+                ProposeFailure::FloorDistanceHold,
+                ProposeRefusal::FloorDistanceHold,
+                "Failure: Proposal held: the merge exceeds the floor-distance cap and no witness block could be built; retrying once finality advances (seqNum 7)",
+            ),
+        ];
+
+        for (failure, expected_refusal, expected_message) in cases {
+            let err = propose_failure_error(&ProposeStatus::Failure(failure), 7);
+            let refused = err
+                .downcast_ref::<ProposeRefusedError>()
+                .unwrap_or_else(|| panic!("untyped propose refusal: {}", err));
+            assert_eq!(refused.refusal, expected_refusal);
+            assert_eq!(err.to_string(), expected_message);
+        }
+    }
+
+    #[test]
+    fn propose_faults_stay_untyped() {
+        let no_new_deploys =
+            propose_failure_error(&ProposeStatus::Failure(ProposeFailure::NoNewDeploys), 1);
+        assert!(no_new_deploys.downcast_ref::<NoNewDeploysError>().is_some());
+
+        for failure in [
+            ProposeFailure::InternalDeployError,
+            ProposeFailure::BugError,
+        ] {
+            let err = propose_failure_error(&ProposeStatus::Failure(failure), 1);
+            assert!(err.downcast_ref::<ProposeRefusedError>().is_none());
+            assert!(err.downcast_ref::<NoNewDeploysError>().is_none());
+        }
     }
 }

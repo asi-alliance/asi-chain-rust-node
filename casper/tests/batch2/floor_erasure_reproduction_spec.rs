@@ -252,7 +252,7 @@ async fn a_stale_based_rejecting_merge_never_becomes_the_floor_over_the_settled_
         )
         .await
         .expect("create sibling contender branch");
-        let BlockCreatorResult::Created(block, _pre, _post) = created else {
+        let BlockCreatorResult::Created(block, ..) = created else {
             panic!("create must mint the sibling contender branch");
         };
         nodes[2]
@@ -417,7 +417,7 @@ async fn a_stale_based_rejecting_merge_never_becomes_the_floor_over_the_settled_
     ]);
     for node in nodes.iter_mut() {
         for b in &topology {
-            if !node.casper.dag_contains(&b.block_hash) {
+            if !node.casper.dag_contains(&b.block_hash).unwrap() {
                 node.process_block(b.clone()).await.expect("topology flush");
             }
         }

@@ -14,23 +14,29 @@ use comm::rust::transport::transport_layer::TransportLayer;
 use models::rust::block_hash::BlockHash;
 use models::rust::casper::pretty_printer::PrettyPrinter;
 use models::rust::casper::protocol::casper_message::{
-    self, ApprovedBlock, ApprovedBlockCandidate, BlockHashMessage, BlockRequest, CasperMessage,
+    self, ApprovedBlock, ApprovedBlockCandidate, BlockPrunedResponse, BlockRequest, CasperMessage,
     FinalizedFloorSeed, HasBlock, HasBlockRequest,
 };
+use models::rust::casper::protocol::packet_type_tag::encoded_block_message_packet;
 use rspace_plus_plus::rspace::hashing::blake2b256_hash::Blake2b256Hash;
 use rspace_plus_plus::rspace::state::exporters::rspace_exporter_items::RSpaceExporterItems;
 use rspace_plus_plus::rspace::state::rspace_exporter::RSpaceExporterInstance;
 use shared::rust::store::key_value_store::MissingBlockContext;
 use tokio::sync::mpsc;
 
+use crate::rust::blocks::ingest::block_ingest::IngestHandle;
+use crate::rust::blocks::ingest::checked_block::IntegrityFailure;
+use crate::rust::blocks::ingest::peer_reputation::Strike;
+use crate::rust::blocks::ingest::receipt_verifier::{ReceiptRefusal, ReceiptVerifier};
 use crate::rust::casper::MultiParentCasper;
-use crate::rust::engine::block_retriever::{self, BlockRetriever};
 use crate::rust::engine::engine::{self, Engine};
 use crate::rust::engine::engine_cell::EngineCell;
-use crate::rust::engine::peer_scoring::Strike;
 use crate::rust::engine::snapshot_chunk_sync::SnapshotChunkSyncDriver;
 use crate::rust::engine::snapshot_chunk_wire::{
     handle_get_snapshot_chunk_request, handle_has_snapshot_request,
+};
+use crate::rust::engine::state_export_limiter::{
+    StateExportLimiter, MAX_PENDING_REQUESTS_PER_PEER, QUEUED_STREAM_BYTES_BUDGET,
 };
 use crate::rust::engine::wal_payload_wire::{
     handle_get_wal_payload_request, handle_has_wal_payload_request,
@@ -38,7 +44,9 @@ use crate::rust::engine::wal_payload_wire::{
 use crate::rust::errors::CasperError;
 use crate::rust::finality::floor::floor_of_block;
 use crate::rust::metrics_constants::{
-    BLOCK_HASH_RECEIVED_METRIC, BLOCK_REQUEST_RECEIVED_METRIC, RUNNING_METRICS_SOURCE,
+    BLOCK_HASH_RECEIVED_METRIC, BLOCK_INGEST_LANE_DROPS_METRIC, BLOCK_INGEST_METRICS_SOURCE,
+    BLOCK_INGEST_PEER_REPUTATION_DROPPED_MESSAGES_METRIC, BLOCK_REQUEST_RECEIVED_METRIC,
+    RUNNING_METRICS_SOURCE,
 };
 use crate::rust::safety::clique_oracle::FtThreshold;
 
@@ -147,22 +155,6 @@ impl WalPayloadContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CasperMessageStatus {
-    BlockIsInDag,
-    BlockIsInCasperBuffer,
-    BlockIsReceived,
-    BlockIsWaitingForCasper,
-    BlockIsInProcessing,
-    DoNotIgnore,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IgnoreCasperMessageStatus {
-    pub do_ignore: bool,
-    pub status: CasperMessageStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastFinalizedBlockNotFoundError;
 
 impl std::fmt::Display for LastFinalizedBlockNotFoundError {
@@ -250,13 +242,30 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> Engine for Running<T> {
     }
 
     async fn handle(&self, peer: PeerNode, msg: CasperMessage) -> Result<(), CasperError> {
+        let view = self.ingest.view();
         let unrequested_block_traffic = match &msg {
             CasperMessage::BlockHashMessage(_) => true,
-            CasperMessage::BlockMessage(b) => !self.block_retriever.awaits_block(&b.block_hash),
-            CasperMessage::HasBlock(h) => !self.block_retriever.awaits_block(&h.hash),
+            CasperMessage::BlockMessage(b) => !view.is_solicited(&b.block_hash),
+            CasperMessage::HasBlock(h) => !view.is_solicited(&h.hash),
+            // A `BlockPrunedResponse` is legitimate only for a hash this
+            // node is actually awaiting; an ignored peer's response for any
+            // other hash is not the solicited answer to a request and is
+            // treated the same way an unsolicited `BlockMessage` is (#1059).
+            CasperMessage::BlockPrunedResponse(r) => !view.is_awaited(&r.hash),
+            // Running never legitimately takes unsolicited `ApprovedBlock`
+            // traffic — it is only ever a response to the startup horizon
+            // probe (#1059). An ignored peer should not be able to spam a
+            // below-horizon warning or push the shared floor upward via a
+            // fabricated response.
+            CasperMessage::ApprovedBlock(_) => true,
             _ => false,
         };
-        if unrequested_block_traffic && self.block_retriever.should_ignore_peer(&peer) {
+        if unrequested_block_traffic && view.is_ignored(&peer) {
+            metrics::counter!(
+                BLOCK_INGEST_PEER_REPUTATION_DROPPED_MESSAGES_METRIC,
+                "source" => BLOCK_INGEST_METRICS_SOURCE
+            )
+            .increment(1);
             tracing::debug!("Ignoring block traffic from scored-out peer {}", peer);
             return Ok(());
         }
@@ -264,11 +273,10 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> Engine for Running<T> {
             CasperMessage::BlockHashMessage(h) => {
                 metrics::counter!(BLOCK_HASH_RECEIVED_METRIC, "source" => RUNNING_METRICS_SOURCE)
                     .increment(1);
-                self.handle_block_hash_message(peer, h, |hash| self.ignore_casper_message(hash))
-                    .await
+                self.handle_announcement(peer, h.block_hash, "BlockHashMessage")
             }
             CasperMessage::BlockMessage(b) => {
-                if self.ignore_casper_message(b.block_hash.clone())? {
+                if self.is_known(&b.block_hash)? {
                     tracing::debug!(
                         "Ignoring BlockMessage {} from {}",
                         PrettyPrinter::build_string_block_message(&b, true),
@@ -276,24 +284,20 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> Engine for Running<T> {
                     );
                 } else {
                     let block_hash = b.block_hash.clone();
-                    let (checked, guard) = match ReceiptVerifier::shared()
-                        .verify_and_mark(&peer.id.key, b, &self.blocks_in_processing)
+                    let checked = match ReceiptVerifier::shared()
+                        .verify(&peer.id.key, b, RUNNING_METRICS_SOURCE, |hash| {
+                            self.is_known(hash)
+                        })
                         .await
                     {
-                        Ok(admitted) => admitted,
+                        Ok(checked) => checked,
                         Err(ReceiptRefusal::Overloaded) => {
-                            if self.block_retriever.awaits_block(&block_hash) {
-                                self.block_retriever.note_local_backpressure_drop(
-                                    &block_hash,
-                                    "running-verification",
-                                );
-                            } else {
-                                metrics::counter!(
-                                    crate::rust::metrics_constants::BLOCK_INFLIGHT_CAP_DROP_METRIC,
-                                    "site" => "running-verification"
-                                )
-                                .increment(1);
-                            }
+                            metrics::counter!(
+                                BLOCK_INGEST_LANE_DROPS_METRIC,
+                                "source" => BLOCK_INGEST_METRICS_SOURCE,
+                                "lane" => "verification"
+                            )
+                            .increment(1);
                             tracing::debug!(
                                 "Dropping BlockMessage {} from {}: block verification is at capacity",
                                 PrettyPrinter::build_string_bytes(&block_hash),
@@ -301,32 +305,26 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> Engine for Running<T> {
                             );
                             return Ok(());
                         }
-                        Err(ReceiptRefusal::Invalid(invalid)) => {
-                            let (strike, reason) = match invalid {
-                                crate::rust::block_status::InvalidBlock::InvalidBlockHash => {
-                                    (Strike::HashMismatch, "hash-mismatch")
-                                }
-                                _ => (Strike::Malformed, "malformed"),
-                            };
-                            metrics::counter!(
-                                crate::rust::metrics_constants::BLOCK_INTEGRITY_REJECTED_METRIC,
-                                "source" => RUNNING_METRICS_SOURCE,
-                                "reason" => reason
-                            )
-                            .increment(1);
-                            self.block_retriever.strike_peer(&peer, &block_hash, strike);
-                            return Ok(());
-                        }
-                        Err(ReceiptRefusal::AlreadyInFlight) => {
+                        Err(ReceiptRefusal::KnownCheck(error)) => return Err(error),
+                        Err(ReceiptRefusal::AlreadyKnown) => {
                             tracing::debug!(
-                                "Skipping BlockMessage {} because it is already queued/in-processing",
+                                "Skipping BlockMessage {}: another copy passed its check",
                                 PrettyPrinter::build_string_bytes(&block_hash)
                             );
                             return Ok(());
                         }
-                        Err(ReceiptRefusal::InFlightCapReached) => {
-                            self.block_retriever
-                                .note_local_backpressure_drop(&block_hash, "running-receipt");
+                        Err(ReceiptRefusal::Invalid(failure)) => {
+                            let strike = match failure {
+                                IntegrityFailure::Malformed => Strike::Malformed,
+                                IntegrityFailure::HashMismatch => Strike::HashMismatch,
+                            };
+                            tracing::warn!(
+                                "Refused BlockMessage {} from {}: {:?}",
+                                PrettyPrinter::build_string_bytes(&block_hash),
+                                peer,
+                                failure
+                            );
+                            self.ingest.misbehaved(peer, strike);
                             return Ok(());
                         }
                     };
@@ -343,16 +341,7 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> Engine for Running<T> {
                         PrettyPrinter::build_string_block_message(checked.block(), true),
                         peer.endpoint.host
                     );
-                    self.block_retriever.note_block_source(&block_hash, &peer)?;
-                    self.block_processing_queue_tx
-                        .send((self.casper.clone(), QueuedBlock::Network(checked), guard))
-                        .await
-                        .map_err(|e| {
-                            CasperError::RuntimeError(format!(
-                                "Failed to send block to queue: {}",
-                                e
-                            ))
-                        })?;
+                    self.ingest.deliver(checked, peer);
                 }
                 Ok(())
             }
@@ -361,15 +350,18 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> Engine for Running<T> {
                 self.handle_block_request(peer, br).await
             }
 
-            // TODO should node say it has block only after it is in DAG, or CasperBuffer is enough? Or even just BlockStore?
-            // https://github.com/rchain/rchain/pull/2943#discussion_r449887701 -- OLD
             CasperMessage::HasBlockRequest(hbr) => {
                 self.handle_has_block_request(peer, hbr, |hash| self.casper.dag_contains(&hash))
                     .await
             }
-            CasperMessage::HasBlock(hb) => {
-                self.handle_has_block_message(peer, hb, |hash| self.ignore_casper_message(hash))
-                    .await
+            CasperMessage::HasBlock(hb) => self.handle_announcement(peer, hb.hash, "HasBlock"),
+            CasperMessage::BlockPrunedResponse(resp) => {
+                self.handle_block_pruned_response(peer, resp);
+                Ok(())
+            }
+            CasperMessage::ApprovedBlock(ab) => {
+                self.handle_approved_block_response(peer, ab).await;
+                Ok(())
             }
             CasperMessage::ForkChoiceTipRequest(_) => {
                 self.handle_fork_choice_tip_request(peer).await
@@ -595,8 +587,7 @@ impl<T: TransportLayer + Send + Sync + Clone + 'static> Engine for Running<T> {
 // NOTE: Changed to use Arc<dyn MultiParentCasper> directly instead of generic M
 // based on discussion with Steven for TestFixture compatibility - avoids ?Sized issues
 pub struct Running<T: TransportLayer + Send + Sync> {
-    block_processing_queue_tx: mpsc::Sender<BlockQueueItem>,
-    blocks_in_processing: Arc<InFlightBlocks>,
+    ingest: IngestHandle,
     casper: Arc<dyn MultiParentCasper + Send + Sync>,
     approved_block: ApprovedBlock,
     // Scala: theInit: F[Unit] - lazy async computation
@@ -607,7 +598,6 @@ pub struct Running<T: TransportLayer + Send + Sync> {
     disable_state_exporter: bool,
     transport: Arc<T>,
     conf: RPConf,
-    block_retriever: BlockRetriever<T>,
     /// Routes incoming [`casper_message::StoreItemsMessage`]s to the runtime
     /// state requester. `None` on a node that cannot need one (genesis
     /// ceremony); without it those messages are dropped, as they always were.
@@ -623,11 +613,8 @@ pub struct Running<T: TransportLayer + Send + Sync> {
     /// configured payload store (observers, test harnesses that
     /// skip the boot pipeline).
     wal_payload_ctx: std::sync::OnceLock<WalPayloadContext>,
+    state_export_limiter: StateExportLimiter,
 }
-
-use crate::rust::blocks::block_processor::{
-    BlockQueueItem, InFlightBlocks, QueuedBlock, ReceiptRefusal, ReceiptVerifier,
-};
 
 impl<T: TransportLayer + Send + Sync> Running<T> {
     /// The floor and frontier of the block we are about to hand over as a sync
@@ -702,8 +689,7 @@ impl<T: TransportLayer + Send + Sync> Running<T> {
     }
 
     pub fn new(
-        block_processing_queue_tx: mpsc::Sender<BlockQueueItem>,
-        blocks_in_processing: Arc<InFlightBlocks>,
+        ingest: IngestHandle,
         casper: Arc<dyn MultiParentCasper + Send + Sync>,
         approved_block: ApprovedBlock,
         the_init: Arc<
@@ -712,12 +698,10 @@ impl<T: TransportLayer + Send + Sync> Running<T> {
         disable_state_exporter: bool,
         transport: Arc<T>,
         conf: RPConf,
-        block_retriever: BlockRetriever<T>,
         state_items_tx: Option<mpsc::Sender<casper_message::StoreItemsMessage>>,
     ) -> Self {
         Running {
-            block_processing_queue_tx,
-            blocks_in_processing,
+            ingest,
             casper,
             approved_block,
             the_init,
@@ -725,10 +709,10 @@ impl<T: TransportLayer + Send + Sync> Running<T> {
             disable_state_exporter,
             transport,
             conf,
-            block_retriever,
             state_items_tx,
             snapshot_chunk_ctx: std::sync::OnceLock::new(),
             wal_payload_ctx: std::sync::OnceLock::new(),
+            state_export_limiter: StateExportLimiter::default(),
         }
     }
 
@@ -763,68 +747,34 @@ impl<T: TransportLayer + Send + Sync> Running<T> {
     #[allow(dead_code)]
     fn wal_payload_ctx(&self) -> Option<&WalPayloadContext> { self.wal_payload_ctx.get() }
 
-    fn ignore_casper_message(&self, hash: BlockHash) -> Result<bool, CasperError> {
-        let blocks_in_processing = self.blocks_in_processing.contains(&hash);
-        let buffer_contains = self.casper.buffer_contains(&hash);
-        let dag_contains = self.casper.dag_contains(&hash);
-        Ok(blocks_in_processing || buffer_contains || dag_contains)
+    /// Held by block ingest or already in the DAG.
+    fn is_known(&self, hash: &BlockHash) -> Result<bool, CasperError> {
+        Ok(self.ingest.view().is_held(hash) || self.casper.dag_contains(hash)?)
     }
 
-    pub async fn handle_block_hash_message(
+    /// A peer says it holds `hash` (a block-hash broadcast or a HasBlock).
+    fn handle_announcement(
         &self,
         peer: PeerNode,
-        bhm: BlockHashMessage,
-        ignore_message_f: impl Fn(BlockHash) -> Result<bool, CasperError>,
+        hash: BlockHash,
+        kind: &'static str,
     ) -> Result<(), CasperError> {
-        let h = bhm.block_hash;
-        if ignore_message_f(h.clone())? {
+        if self.is_known(&hash)? {
             tracing::debug!(
-                "Ignoring {} hash broadcast",
-                PrettyPrinter::build_string_bytes(&h)
-            );
-        } else {
-            tracing::debug!(
-                "Incoming BlockHashMessage {} from {}",
-                PrettyPrinter::build_string_bytes(&h),
+                "Ignoring {} {} from {}",
+                kind,
+                PrettyPrinter::build_string_bytes(&hash),
                 peer.endpoint.host
             );
-            self.block_retriever
-                .admit_hash(
-                    h,
-                    Some(peer),
-                    block_retriever::AdmitHashReason::HashBroadcastReceived,
-                )
-                .await?;
+            return Ok(());
         }
-        Ok(())
-    }
-
-    pub async fn handle_has_block_message(
-        &self,
-        peer: PeerNode,
-        hb: HasBlock,
-        ignore_message_f: impl Fn(BlockHash) -> Result<bool, CasperError>,
-    ) -> Result<(), CasperError> {
-        let h = hb.hash;
-        if ignore_message_f(h.clone())? {
-            tracing::debug!(
-                "Ignoring {} HasBlockMessage",
-                PrettyPrinter::build_string_bytes(&h)
-            );
-        } else {
-            tracing::debug!(
-                "Incoming HasBlockMessage {} from {}",
-                PrettyPrinter::build_string_bytes(&h),
-                peer.endpoint.host
-            );
-            self.block_retriever
-                .admit_hash(
-                    h,
-                    Some(peer),
-                    block_retriever::AdmitHashReason::HasBlockMessageReceived,
-                )
-                .await?;
-        }
+        tracing::debug!(
+            "Incoming {} {} from {}",
+            kind,
+            PrettyPrinter::build_string_bytes(&hash),
+            peer.endpoint.host
+        );
+        self.ingest.announce(hash, peer);
         Ok(())
     }
 
@@ -833,33 +783,213 @@ impl<T: TransportLayer + Send + Sync> Running<T> {
         peer: PeerNode,
         br: BlockRequest,
     ) -> Result<(), CasperError> {
-        let maybe_block = self.casper.block_store().get(&br.hash)?;
-        if let Some(block) = maybe_block {
+        let maybe_encoded = self.casper.block_store().get_encoded(&br.hash)?;
+        if let Some(encoded) = maybe_encoded {
             tracing::info!(
                 "Received request for block {} from {}. Response sent.",
                 PrettyPrinter::build_string_bytes(&br.hash),
                 peer
             );
             self.transport
-                .stream_message_to_peer(&self.conf, &peer, Arc::new(block.to_proto()))
+                .stream_packet_to_peer(
+                    &self.conf,
+                    &peer,
+                    encoded_block_message_packet(encoded.into()),
+                )
                 .await?;
-        } else {
-            tracing::info!(
-                "Received request for block {} from {}. No response given since block not found.",
+            return Ok(());
+        }
+
+        // Body is missing. Distinguish "the retention sweep deleted it"
+        // (BlockPrunedResponse) from "we have no record" (silent, as before).
+        // The DAG metadata index is not swept by #1010 / #1045, so its
+        // presence of the hash tells us we knew the block once. Mirrors the
+        // client-API split introduced in #1052 (BlockPrunedError) onto the
+        // peer-to-peer wire so a requester can switch to LFS instead of
+        // retrying forever (#1059).
+        let dag = self.casper.block_dag().await?;
+        if let Some(metadata) = dag.lookup(&br.hash)? {
+            let prune_floor = self
+                .casper
+                .effective_anchor_handle()
+                .load(std::sync::atomic::Ordering::Acquire);
+            // Only claim "pruned" when the block is actually at or below our
+            // body-prune floor. Metadata-present-but-body-missing above the
+            // anchor is an inconsistent-storage edge case, not a GC sweep:
+            // stay silent (as before #1059) rather than mislead the requester
+            // into a false below-horizon signal.
+            if metadata.block_number <= prune_floor {
+                tracing::info!(
+                    "Received request for block {} from {}. Block pruned at height {} (floor {}); sending BlockPrunedResponse.",
+                    PrettyPrinter::build_string_bytes(&br.hash),
+                    peer,
+                    metadata.block_number,
+                    prune_floor
+                );
+                let pruned = BlockPrunedResponse {
+                    hash: br.hash,
+                    block_height: metadata.block_number,
+                    prune_floor,
+                };
+                self.transport
+                    .send_message_to_peer(&self.conf, &peer, Arc::new(pruned.to_proto()))
+                    .await?;
+                return Ok(());
+            }
+            tracing::warn!(
+                "Block {} metadata is present but body is missing above the prune floor (height {}, floor {}); not responding",
                 PrettyPrinter::build_string_bytes(&br.hash),
+                metadata.block_number,
+                prune_floor
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Received request for block {} from {}. No response given since block not found.",
+            PrettyPrinter::build_string_bytes(&br.hash),
+            peer
+        );
+        Ok(())
+    }
+
+    /// Running's answer to an incoming `ApprovedBlock`. We never request an
+    /// approved block from peers except at startup, as the horizon probe
+    /// (#1059): the response carries `floorSeed.floor_number`, the peer's
+    /// current finalized floor. If that floor is far enough above our DAG
+    /// height that peers' block-store GC has swept past us, record the
+    /// below-horizon signal on the shared view so the operator sees the
+    /// actionable warning and does not wait for cited-block retries to
+    /// trickle out the same information.
+    ///
+    /// Guards against unsolicited / cross-shard messages: the incoming
+    /// approved block must declare our shard id (ruling out a cross-shard
+    /// response or an obviously forged stub), and the reported floor must
+    /// be strictly positive. Comparing against our stored approved block's
+    /// block_hash would not work here: a peer's response to the
+    /// `trim_state=true` request names their CURRENT last finalized block,
+    /// not our original anchor; see the `ApprovedBlockRequest` arm above.
+    pub async fn handle_approved_block_response(
+        &self,
+        peer: PeerNode,
+        approved_block: ApprovedBlock,
+    ) {
+        let our_shard = &self.casper.casper_shard_conf().shard_name;
+        if &approved_block.candidate.block.shard_id != our_shard {
+            tracing::debug!(
+                peer = %peer,
+                received_shard = %approved_block.candidate.block.shard_id,
+                expected_shard = %our_shard,
+                "Dropping ApprovedBlock from a different shard; skipping horizon probe"
+            );
+            return;
+        }
+        let Some(seed) = approved_block.floor_seed.as_ref() else {
+            tracing::debug!(
+                "Received ApprovedBlock from {} with no floorSeed; skipping horizon probe",
                 peer
             );
+            return;
+        };
+        let peer_floor = seed.floor_number;
+        if peer_floor <= 0 {
+            tracing::debug!(
+                peer = %peer,
+                peer_floor,
+                "Dropping ApprovedBlock with non-positive floor; skipping horizon probe"
+            );
+            return;
         }
-        Ok(())
+        let dag = match self.casper.block_dag().await {
+            Ok(dag) => dag,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not read DAG for horizon probe; skipping"
+                );
+                return;
+            }
+        };
+        let our_latest_height: i64 = dag
+            .latest_message_hashes()
+            .values()
+            .filter_map(|hash| dag.lookup(hash).ok().flatten().map(|m| m.block_number))
+            .max()
+            .unwrap_or(0);
+        let shard = self.casper.casper_shard_conf();
+        let required_height = horizon_required_height(
+            peer_floor,
+            shard.max_parent_depth,
+            shard.mergeable_channels_gc_depth_buffer,
+            shard.deploy_lifespan,
+            shard.enable_block_store_gc,
+        );
+        if our_latest_height < required_height {
+            tracing::warn!(
+                peer = %peer,
+                peer_floor,
+                our_latest_height,
+                required_height,
+                "Startup horizon probe: this node's latest message is below peers' block-store GC horizon. \
+                 It cannot catch up by re-requesting blocks (peers have deleted them). Stop this node, \
+                 remove its data directory, and restart to re-join via the last-finalized-state path (#1059)."
+            );
+            self.ingest.view().record_below_horizon(peer_floor);
+            metrics::counter!(
+                crate::rust::metrics_constants::BLOCK_INGEST_BELOW_HORIZON_METRIC,
+                "source" => crate::rust::metrics_constants::BLOCK_INGEST_METRICS_SOURCE
+            )
+            .increment(1);
+        } else {
+            tracing::debug!(
+                peer = %peer,
+                peer_floor,
+                our_latest_height,
+                required_height,
+                "Startup horizon probe: within window"
+            );
+        }
+    }
+
+    /// A peer answered a `BlockRequest` we sent (directly or via an upstream
+    /// requester) with `BlockPrunedResponse`: the block has been swept past
+    /// the peer's horizon. Hand the signal to block ingest so the fetch
+    /// scheduler stops retrying and the below-horizon flag is set on the
+    /// shared view (#1059).
+    ///
+    /// Guards against unsolicited responses: an attacker peer cannot flip
+    /// the shared below-horizon flag or drop an arbitrary need by sending
+    /// pruned-responses for hashes the node never asked for. We only accept
+    /// the signal for hashes block ingest is currently awaiting.
+    pub fn handle_block_pruned_response(&self, peer: PeerNode, resp: BlockPrunedResponse) {
+        if !self.ingest.view().is_awaited(&resp.hash) {
+            tracing::debug!(
+                "Dropping unsolicited BlockPrunedResponse from {} for block {} (height {}, floor {})",
+                peer,
+                PrettyPrinter::build_string_bytes(&resp.hash),
+                resp.block_height,
+                resp.prune_floor
+            );
+            return;
+        }
+        tracing::debug!(
+            "Received BlockPrunedResponse from {} for block {} (height {}, floor {})",
+            peer,
+            PrettyPrinter::build_string_bytes(&resp.hash),
+            resp.block_height,
+            resp.prune_floor
+        );
+        self.ingest
+            .block_pruned(resp.hash, resp.block_height, resp.prune_floor, peer);
     }
 
     pub async fn handle_has_block_request(
         &self,
         peer: PeerNode,
         hbr: HasBlockRequest,
-        block_lookup: impl Fn(BlockHash) -> bool,
+        block_lookup: impl Fn(BlockHash) -> Result<bool, CasperError>,
     ) -> Result<(), CasperError> {
-        if block_lookup(hbr.hash.clone()) {
+        if block_lookup(hbr.hash.clone())? {
             let has_block = HasBlock { hash: hbr.hash };
             self.transport
                 .send_message_to_peer(&self.conf, &peer, Arc::new(has_block.to_proto()))
@@ -989,14 +1119,46 @@ impl<T: TransportLayer + Send + Sync> Running<T> {
             return Ok(());
         }
 
-        let exporter = self.casper.get_history_exporter().await;
+        let Some(_slot) = self.state_export_limiter.reserve(&peer) else {
+            tracing::warn!(
+                %peer,
+                max = MAX_PENDING_REQUESTS_PER_PEER,
+                "Too many StoreItemsMessageRequests in progress for peer; ignoring"
+            );
+            return Ok(());
+        };
+        let Some(_permit) = self
+            .state_export_limiter
+            .acquire(|| self.transport.queued_stream_bytes())
+            .await
+        else {
+            tracing::warn!(
+                %peer,
+                budget = QUEUED_STREAM_BYTES_BUDGET,
+                "Outgoing stream queue stayed over its byte budget; ignoring StoreItemsMessageRequest"
+            );
+            return Ok(());
+        };
 
-        let (history, data) = match RSpaceExporterItems::get_history_and_data(
-            exporter,
-            start_path.clone(),
-            skip,
-            take,
-        ) {
+        let exporter = self.casper.get_history_exporter().await;
+        let export_path = start_path.clone();
+        let export = match tokio::task::spawn_blocking(move || {
+            RSpaceExporterItems::get_history_and_data(exporter, export_path, skip, take)
+        })
+        .await
+        {
+            Ok(export) => export,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %peer,
+                    "State export task for StoreItemsMessageRequest failed; ignoring"
+                );
+                return Ok(());
+            }
+        };
+
+        let (history, data) = match export {
             Ok(items) => items,
             Err(error) => {
                 tracing::warn!(
@@ -1029,5 +1191,75 @@ impl<T: TransportLayer + Send + Sync> Running<T> {
 
         tracing::info!("Store items sent to {}", peer);
         Ok(())
+    }
+}
+
+/// The minimum block height at which the startup horizon probe is still
+/// satisfied for a peer at `peer_floor`. Matches the block-store GC
+/// formula in `mergeable_channels_gc::job::start_pass`:
+/// `floor - (max_parent_depth + depth_buffer + deploy_lifespan)` when body
+/// GC is on, `floor - (max_parent_depth + depth_buffer)` otherwise.
+/// Saturating math: when `max_parent_depth` is `i32::MAX` (unlimited) the
+/// subtraction saturates at `i64::MIN`, so any real local height is
+/// `>= required_height` and the probe correctly becomes inert.
+pub(crate) fn horizon_required_height(
+    peer_floor: i64,
+    max_parent_depth: i32,
+    depth_buffer: i32,
+    deploy_lifespan: i64,
+    enable_block_store_gc: bool,
+) -> i64 {
+    let citation_depth: i64 = i64::from(max_parent_depth).saturating_add(i64::from(depth_buffer));
+    let depth = if enable_block_store_gc {
+        citation_depth.saturating_add(deploy_lifespan)
+    } else {
+        citation_depth
+    };
+    peer_floor.saturating_sub(depth)
+}
+
+#[cfg(test)]
+mod horizon_required_height_tests {
+    use super::horizon_required_height;
+
+    #[test]
+    fn with_body_gc_subtracts_full_citation_plus_lifespan() {
+        // floor=1000, max_parent_depth=10, buffer=25, lifespan=300 → 1000 - 335 = 665
+        assert_eq!(horizon_required_height(1000, 10, 25, 300, true), 665);
+    }
+
+    #[test]
+    fn without_body_gc_uses_only_citation_depth() {
+        // Same peer_floor, body GC off: lifespan drops out.
+        assert_eq!(horizon_required_height(1000, 10, 25, 300, false), 965);
+    }
+
+    #[test]
+    fn small_floor_is_handled_without_underflow() {
+        // Peer at a very early floor: the probe is permissive (required
+        // height may be negative, which any real latest-message satisfies).
+        assert_eq!(horizon_required_height(50, 10, 25, 300, true), -285);
+    }
+
+    #[test]
+    fn unlimited_max_parent_depth_makes_the_probe_inert() {
+        // When max_parent_depth is the "unlimited" sentinel, required_height
+        // becomes a very large negative number (peer_floor - i32::MAX - …),
+        // which any real latest-message satisfies. The probe does not fire.
+        let required = horizon_required_height(1000, i32::MAX, 25, 300, true);
+        assert!(
+            required < -i64::from(i32::MAX / 2),
+            "unlimited parent depth should push required_height very negative, got {}",
+            required
+        );
+        // And any real height satisfies it:
+        assert!(0i64 >= required);
+    }
+
+    #[test]
+    fn negative_peer_floor_is_handled_gracefully() {
+        // Caller filters peer_floor <= 0 before reaching here, but the
+        // function must not panic for a nonsensical input.
+        assert_eq!(horizon_required_height(-1, 10, 25, 300, true), -336);
     }
 }

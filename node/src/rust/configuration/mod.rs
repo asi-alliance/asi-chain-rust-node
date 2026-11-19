@@ -182,6 +182,50 @@ pub mod builder {
             ));
         }
 
+        // `disable-lfs = true` tells the node to bootstrap by replaying
+        // every block from genesis forward instead of starting from the
+        // last-finalized-state anchor. That replay needs:
+        //   - every block body from genesis onward (to know what to
+        //     replay), and
+        //   - every intermediate historical trie state (so each block's
+        //     deploys can apply against the prior state).
+        //
+        // Either GC flag makes the local store a non-conformant target
+        // for that replay. `enable-block-store-gc = true` removes
+        // finalized block bodies past the citation horizon, so a replay
+        // that walks past the horizon hits the pruned gap and fails
+        // with no path to recover on this node (block bodies are
+        // primary data; there is no recompute). `enable-history-pruning
+        // = true` sweeps the historical radix trie, so a replay that
+        // tries to `reset` to a pre-pruned state can hit `MissingNode`
+        // at a descendant.
+        //
+        // We cannot validate the whole shard's configuration — remote
+        // peers may have the opposite flags — but we can and do refuse
+        // the combination on THIS node, which is the one whose startup
+        // would miscarry.
+        if node_conf.protocol_client.disable_lfs {
+            if node_conf.casper.enable_block_store_gc {
+                eyre::bail!(
+                    "protocol-client.disable-lfs = true and casper.enable-block-store-gc = true \
+                    are mutually exclusive: a genesis-forward bootstrap needs every finalized \
+                    block body, but block-store GC removes bodies past the citation horizon. \
+                    Choose one: either keep LFS enabled (disable-lfs = false) to join from the \
+                    last-finalized-state anchor, or turn off block-store GC on this node."
+                );
+            }
+            if node_conf.casper.enable_history_pruning {
+                eyre::bail!(
+                    "protocol-client.disable-lfs = true and casper.enable-history-pruning = true \
+                    are mutually exclusive: a genesis-forward bootstrap walks the full history \
+                    trie, but history pruning sweeps trie nodes past the retention window and a \
+                    later reset into a swept subtree surfaces a MissingNode. Choose one: either \
+                    keep LFS enabled (disable-lfs = false) to join from the last-finalized-state \
+                    anchor, or turn off history pruning on this node."
+                );
+            }
+        }
+
         // A negative threshold weakens "finalized" from a BFT certificate
         // (mutual-witnessing clique; revert requires >= theta equivocating
         // stake) to bare majority agreement per snapshot, which can flip
@@ -226,12 +270,12 @@ pub mod builder {
             }
         }
 
-        // A dropped delivery freezes the receiver's view until the retriever
-        // recovers it, and the recovery that must fit inside the citability
-        // window is the FULL re-request ladder (every backoff interval until
-        // the retry budget exhausts), not just the first anchor interval.
+        // A dropped delivery freezes the receiver's view until block ingest
+        // asks for it again; the recovery that must fit inside the
+        // citability window is the re-request ladder up to its slowest
+        // interval, not just the first one.
         let recovery_span = std::time::Duration::from_millis(
-            casper::rust::engine::block_retriever::total_unresolved_rerequest_span_ms(),
+            casper::rust::blocks::ingest::fetch_scheduler::total_unresolved_rerequest_span_ms(),
         );
         if max_parent_depth != i32::MAX && max_parent_depth > 0 {
             let citability_window = node_conf
@@ -243,7 +287,7 @@ pub mod builder {
                 warnings.push(format!(
                     "the citability window (max-parent-depth {} x heartbeat.check-interval \
                     {:?} = {:?}) is smaller than the full dependency-recovery re-request \
-                    span ({:?} across the whole retry budget): a lost block delivery \
+                    span ({:?} until re-requests reach their slowest interval): a lost block delivery \
                     cannot finish recovering before its blocks fall below the parent-depth \
                     horizon, converting a dropped packet into a finality stall. Raise \
                     max-parent-depth or slow the cadence.",
@@ -264,6 +308,9 @@ pub mod builder {
                 horizon are undefined at zero or below",
                 max_parent_depth,
             ));
+        }
+        if node_conf.casper.dag_hot_window_depth <= 0 {
+            return Err(eyre::eyre!("casper.dag-hot-window-depth must be positive"));
         }
         if node_conf.casper.deploy_lifespan <= 0 {
             return Err(eyre::eyre!(
@@ -734,7 +781,7 @@ mod embedded_defaults_tests {
 
         assert_eq!(
             cfg.logging.filter,
-            "info,tonic=error,hyper=error,tower=error,reqwest=error,heed=error,h2=error,comm::rust::transport::transport_layer=warn,casper::rust::engine::block_retriever=warn,casper::rust::engine::multi_parent_casper::validation_dispatcher=warn,casper::rust::util::rholang::interpreter_util=warn"
+            "info,tonic=error,hyper=error,tower=error,reqwest=error,heed=error,h2=error,comm::rust::transport::transport_layer=warn,casper::rust::engine::multi_parent_casper::validation_dispatcher=warn,casper::rust::util::rholang::interpreter_util=warn"
         );
         assert!(matches!(cfg.logging.format, LogFormat::Json));
         assert!(matches!(cfg.logging.sink, LogSink::Stdout));
@@ -763,6 +810,29 @@ mod embedded_defaults_tests {
         assert_eq!(cfg.logging.file.max_total_size_bytes, 1024);
         assert!(matches!(cfg.logging.file.rotation, LogRotation::Daily));
         assert_eq!(cfg.logging.file.retention, 14);
+    }
+
+    #[test]
+    fn report_cache_retention_outside_its_range_is_rejected() {
+        for value in ["-1", "4294967296"] {
+            let override_config = format!("api-server.report-cache-retention-blocks = {value}");
+            let result: Result<NodeConf, _> = hocon::HoconLoader::new()
+                .load_str(EMBEDDED_DEFAULTS)
+                .unwrap()
+                .load_str(&override_config)
+                .unwrap()
+                .resolve();
+            assert!(result.is_err(), "{value}");
+        }
+
+        let cfg: NodeConf = hocon::HoconLoader::new()
+            .load_str(EMBEDDED_DEFAULTS)
+            .unwrap()
+            .load_str("api-server.report-cache-retention-blocks = 4294967295")
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(cfg.api_server.report_cache_retention_blocks, u32::MAX);
     }
 
     #[test]
@@ -832,6 +902,58 @@ mod embedded_defaults_tests {
                 assert!(result.is_err(), "{field}={value}");
             }
         }
+    }
+
+    #[test]
+    fn deploy_pool_limits_default_and_allow_explicit_overrides() {
+        use block_storage::rust::deploy::key_value_deploy_storage::DeployPoolLimits;
+
+        let load = |overrides: &str| {
+            hocon::HoconLoader::new()
+                .load_str(EMBEDDED_DEFAULTS)
+                .unwrap()
+                .load_str(overrides)
+                .unwrap()
+                .resolve::<NodeConf>()
+        };
+        let defaults = DeployPoolLimits::default();
+        let base = load("").unwrap();
+        assert_eq!(base.casper.deploy_admission, defaults);
+        assert_eq!(base.api_server.deploy_max_inflight, None);
+        let resolved = hocon::HoconLoader::new()
+            .load_str(EMBEDDED_DEFAULTS)
+            .unwrap()
+            .hocon()
+            .unwrap();
+        let hocon::Hocon::Hash(mut missing) = resolved["casper"].clone() else {
+            panic!("expected a casper configuration object");
+        };
+        missing.remove("deploy-admission");
+        let parsed: casper::rust::casper_conf::CasperConf =
+            hocon::Hocon::Hash(missing).resolve().unwrap();
+        assert_eq!(parsed.deploy_admission, defaults);
+        let inflight = load("api-server.deploy-max-inflight = 2").unwrap();
+        assert_eq!(inflight.casper.deploy_admission, defaults);
+        assert_eq!(inflight.api_server.deploy_max_inflight, Some(2));
+        let no_inflight = load("api-server.deploy-max-inflight = null").unwrap();
+        assert_eq!(no_inflight.api_server.deploy_max_inflight, None);
+        let configured =
+            load("casper.deploy-admission { max-records = 128, max-bytes = 4096 }").unwrap();
+        assert_eq!(configured.casper.deploy_admission, DeployPoolLimits {
+            max_records: 128,
+            max_bytes: 4096,
+        });
+        assert_eq!(
+            load("casper.deploy-admission.max-records = 128")
+                .unwrap()
+                .casper
+                .deploy_admission,
+            DeployPoolLimits {
+                max_records: 128,
+                ..defaults
+            }
+        );
+        assert!(load("casper.deploy-admission.max-byte = 4096").is_err());
     }
 
     #[test]
@@ -1022,11 +1144,42 @@ mod embedded_defaults_tests {
             "deploy-lifespan 0 must fail startup"
         );
 
-        let mut cfg = base;
+        let mut cfg = base.clone();
         cfg.casper.genesis_block_data.epoch_length = 0;
         assert!(
             builder::validate_config(&cfg).is_err(),
             "epoch-length 0 must fail startup"
+        );
+
+        // disable-lfs = true + enable-block-store-gc = true is unsound:
+        // genesis-forward replay walks every finalized block body, but
+        // block-store GC removes bodies past the citation horizon. The
+        // startup check refuses the combination on this node.
+        let mut cfg = base.clone();
+        cfg.protocol_client.disable_lfs = true;
+        cfg.casper.enable_block_store_gc = true;
+        cfg.casper.enable_history_pruning = false;
+        let err = builder::validate_config(&cfg)
+            .expect_err("disable-lfs + block-store GC must fail startup");
+        assert!(
+            err.to_string().contains("disable-lfs")
+                && err.to_string().contains("enable-block-store-gc"),
+            "error must name both flags, got: {err}"
+        );
+
+        // disable-lfs = true + enable-history-pruning = true is unsound
+        // for the same reason — the pruner sweeps historical trie nodes
+        // a genesis-forward replay would reset into.
+        let mut cfg = base;
+        cfg.protocol_client.disable_lfs = true;
+        cfg.casper.enable_block_store_gc = false;
+        cfg.casper.enable_history_pruning = true;
+        let err = builder::validate_config(&cfg)
+            .expect_err("disable-lfs + history-pruning must fail startup");
+        assert!(
+            err.to_string().contains("disable-lfs")
+                && err.to_string().contains("enable-history-pruning"),
+            "error must name both flags, got: {err}"
         );
     }
 
@@ -1080,6 +1233,24 @@ mod embedded_defaults_tests {
         assert_eq!(
             cfg.casper.enable_mergeable_channel_gc,
             casper::rust::casper_conf::default_enable_mergeable_channel_gc(),
+            "serde fallback must match the shipped default"
+        );
+    }
+
+    /// Same class as `mergeable_gc_fallback_matches_shipped_default`: a sparse
+    /// operator conf omitting the key must land on the shipped default, not
+    /// on a quietly different serde fallback.
+    #[test]
+    fn block_store_gc_fallback_matches_shipped_default() {
+        let cfg: NodeConf = hocon::HoconLoader::new()
+            .load_str(EMBEDDED_DEFAULTS)
+            .expect("load defaults.conf")
+            .resolve()
+            .expect("deserialize NodeConf");
+        assert!(cfg.casper.enable_block_store_gc, "shipped default");
+        assert_eq!(
+            cfg.casper.enable_block_store_gc,
+            casper::rust::casper_conf::default_enable_block_store_gc(),
             "serde fallback must match the shipped default"
         );
     }
@@ -1255,13 +1426,13 @@ mod embedded_defaults_tests {
         let shipped = &cfg.casper.heartbeat_conf;
 
         assert!(shipped.enabled);
-        assert_eq!(shipped.check_interval, Duration::from_secs(5));
-        assert_eq!(shipped.max_lfb_age, Duration::from_secs(5));
+        assert_eq!(shipped.check_interval, Duration::from_secs(3));
+        assert_eq!(shipped.max_lfb_age, Duration::from_secs(3));
         assert_eq!(shipped.self_propose_cooldown, Duration::from_secs(3));
         assert_eq!(shipped.stale_recovery_min_interval, None);
         assert_eq!(
             shipped.resolved_stale_recovery_min_interval(),
-            Duration::from_millis(7_500)
+            Duration::from_millis(4_500)
         );
         assert_eq!(shipped.finality_progress_timeout, Duration::from_secs(30));
         assert_eq!(shipped.deploy_finalization_grace, Duration::from_secs(25));
@@ -1274,8 +1445,8 @@ mod embedded_defaults_tests {
             .load_str(
                 r#"
                 enabled = true
-                check-interval = 5 seconds
-                max-lfb-age = 5 seconds
+                check-interval = 3 seconds
+                max-lfb-age = 3 seconds
                 "#,
             )
             .expect("load sparse heartbeat conf")
