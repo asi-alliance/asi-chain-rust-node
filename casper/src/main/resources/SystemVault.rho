@@ -211,12 +211,12 @@ in {
             }
           } |
           // Used during genesis to create PoS vault with initial balance = sum of initial bonds.
-          // Can only be used to create the PoS vault, i.e. Vault address = "1111gW5kkGxHg7xDg6dRkZx2f7qxTizJzaCH9VEM1oJKWRvSX9Sk5".
-          for (@"createWithBalance", @"1111gW5kkGxHg7xDg6dRkZx2f7qxTizJzaCH9VEM1oJKWRvSX9Sk5", @amount, retCh <- SystemVault) {
+          // Can only be used to create the PoS vault, i.e. Vault address = "asi78MSQPrzysBtrUkSwHi9SH2udJNcKj5WEMPbjjr9QwfpMppFXDT".
+          for (@"createWithBalance", @"asi78MSQPrzysBtrUkSwHi9SH2udJNcKj5WEMPbjjr9QwfpMppFXDT", @amount, retCh <- SystemVault) {
             new createVault, vaultCh in {
-              _create!("1111gW5kkGxHg7xDg6dRkZx2f7qxTizJzaCH9VEM1oJKWRvSX9Sk5", *createVault, *vaultCh) |
+              _create!("asi78MSQPrzysBtrUkSwHi9SH2udJNcKj5WEMPbjjr9QwfpMppFXDT", *createVault, *vaultCh) |
               for (vaultRetCh <- createVault) {
-                _makeVault!("1111gW5kkGxHg7xDg6dRkZx2f7qxTizJzaCH9VEM1oJKWRvSX9Sk5", amount, *vaultRetCh) |
+                _makeVault!("asi78MSQPrzysBtrUkSwHi9SH2udJNcKj5WEMPbjjr9QwfpMppFXDT", amount, *vaultRetCh) |
                 for (@eitherVault <- vaultCh) {
                   retCh!(eitherVault)
                 }

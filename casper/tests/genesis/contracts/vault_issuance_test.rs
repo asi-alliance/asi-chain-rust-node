@@ -97,9 +97,9 @@ async fn rev_vault_balance(node: &mut TestNode, shard_id: &str, rev_address: &st
 async fn vault_issuance_test() {
     // Two known, valid rev addresses issued at genesis with distinct non-zero balances. Distinct
     // values make each per-address assertion load-bearing (a result cannot pass by symmetry).
-    const REV_ADDRESS_1: &str = "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP";
+    const REV_ADDRESS_1: &str = "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch";
     const BALANCE_1: u64 = 777_000_000;
-    const REV_ADDRESS_2: &str = "1111La6tHaCtGjRiv4wkffbTAAjGyMsVhzSUNzQxH1jjZH9jtEi3M";
+    const REV_ADDRESS_2: &str = "asi781WRXQJETnWKyzRFcdF5hXxWctFCunvUYd6vM7MrMifb4qDA2n";
 
     // Build genesis whose vault set includes the two issued vaults alongside the default
     // validator/deployer vaults. Passing explicit parameters (rather than `with_vaults`) makes the

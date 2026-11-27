@@ -416,7 +416,7 @@ async fn pending_deploys_logic(
     get,
     path = "/api/balance/{address}",
     params(
-        ("address" = String, Path, description = "Native-token wallet address (Base58-encoded, starts with `1111`)"),
+        ("address" = String, Path, description = "Native-token wallet address (Base58-encoded, starts with `asi`)"),
         ("block_hash" = Option<String>, Query, description = "Block hash to query against; defaults to the last-finalized block"),
     ),
     responses(

@@ -137,7 +137,7 @@ docker exec rnode.validator1 /opt/docker/bin/node bond-status \
 
 Within ~30s you'll see `Heartbeat: Successfully created block` entries in `docker logs rnode.validator4`.
 
-**Note:** the above works because `docker/genesis/wallets.txt` funds validator4's REV address (`1111La6tHaCt...jtEi3M`). If you swap in a different validator key, you'll need to add its REV address to `wallets.txt` and restart the shard (volumes must be wiped). Compute the address with:
+**Note:** the above works because `docker/genesis/wallets.txt` funds validator4's REV address (`asi781WRXQJ...b4qDA2n`). If you swap in a different validator key, you'll need to add its REV address to `wallets.txt` and restart the shard (volumes must be wiped). Compute the address with:
 
 ```bash
 sed 's/%PUB_KEY/<your-pubkey>/' rholang/examples/vault_demo/1.know_ones_vaultaddress.rho > /tmp/revaddr.rho

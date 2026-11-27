@@ -11,7 +11,7 @@ pub struct VaultAddress {
     address: Address,
 }
 
-pub const COIN_ID: &str = "000000";
+pub const COIN_ID: &str = "0BC117";
 
 pub const VERSION: &str = "00";
 
@@ -60,4 +60,32 @@ impl VaultAddress {
     }
 
     pub fn is_valid(address: &str) -> bool { VaultAddress::parse(address).is_ok() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PUBLIC_KEY_HEX: &str = "042b02e3069f5aaa09fc856d16abbf43a8f3cd45f8fa8889e4a2744ffd14f418a398945ec5ea08603c3726e794e9b936c3d45894fdb9f2df5591bdaea6607e6b0a";
+
+    #[test]
+    fn a_derived_address_starts_with_the_asi_prefix() {
+        let public_key = PublicKey::from_bytes(&hex::decode(PUBLIC_KEY_HEX).unwrap());
+        let address = VaultAddress::from_public_key(&public_key)
+            .expect("the public key length matches the address key length")
+            .to_base58();
+
+        assert_eq!(
+            address,
+            "asi78gypQDk2wtUukB4Nr8JMxuqt7zVNYUooUTfM1MfEDJJxdLsxDt"
+        );
+        assert!(VaultAddress::is_valid(&address));
+    }
+
+    #[test]
+    fn a_previous_format_address_is_refused() {
+        assert!(!VaultAddress::is_valid(
+            "1111223Vm721NNi1V6i4zAisiY46n5c38PsmQDYqcXK7b8vXFwZSsi"
+        ));
+    }
 }

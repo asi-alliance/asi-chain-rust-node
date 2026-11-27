@@ -26,7 +26,7 @@ use serial_test::serial;
 use crate::helper::test_node::TestNode;
 use crate::util::genesis_builder::GenesisBuilder;
 
-const RECIPIENT: &str = "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP";
+const RECIPIENT: &str = "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch";
 
 fn transfer(payer: &str, timestamp: i64, shard_id: &str) -> Signed<DeployData> {
     transfer_with_phlo(payer, timestamp, 1_000_000, shard_id)
