@@ -42,7 +42,7 @@ in {
 
   contract test_valid_address(rhoSpec, _, ackCh) = {
     new retCh in {
-      vaultAddress!("validate", "1111K9MczqzZrNkUNmNGrNFyz7F7LiCUgaCHXd28g2k5PxiaNuCAi", *retCh) |
+      vaultAddress!("validate", "asi77z5gG7a29N9ejT7g8owkEMu2TFbXtmWEMmjXXWNrhZM9yToqnf", *retCh) |
       rhoSpec!("assert", (Nil, "== <-", *retCh), "expecting a Nil value since there are no errors", *ackCh)
     }
   } |
@@ -65,9 +65,9 @@ in {
         *r3
       ) |
       rhoSpec!("assertMany", [
-        (("1111WPpi6SB8FpNMtC9drZg3R8T1fH2BVyT52xPUXBbdKDfmskG1r", "== <-", *r1), "correct VaultAddress"),
-        (("1111pdZDG4MZ3eBfaipaD22VXmbFY6PW9ZdGDWdEcXZz4gGxTxgn9", "== <-", *r2), "correct VaultAddress"),
-        (("11112CXAkc8pV2AMHUSgHGbFkqovgyY9SRja4ZLSpRC9q7qYZx5SVc", "== <-", *r3), "correct VaultAddress"),
+        (("asi78BL9MDAChmbGcxYTVp9AHnvEMaAMbauV9H4tsMXiFUc77PN51Y", "== <-", *r1), "correct VaultAddress"),
+        (("asi78VZsrNnP8ZR5vf58SAbWjuZNbSyivEVfLTd8dSsgcE4iQ2vpa8", "== <-", *r2), "correct VaultAddress"),
+        (("asi78sTVPirr4XwFYYnz9EAk1Dbi2tRUrWfc8oSxDFYGTHDyspEDjF", "== <-", *r3), "correct VaultAddress"),
      ], *ackCh)
     }
   } |
@@ -116,7 +116,7 @@ in {
   contract test_fromDeployerId(rhoSpec, _, ackCh) = {
     new deployerId(`rho:system:deployerId`), retCh in {
       vaultAddress!("fromDeployerId", *deployerId, *retCh) |
-      rhoSpec!("assert", ("11112VYAt8rUGNRRZX3eJdgagaAhtWTK8Js7F7X5iqddMVqyDTtYau", "== <-", *retCh), "correct VaultAddress", *ackCh)
+      rhoSpec!("assert", ("asi79AUVXFaVqtCKpbPxAbG4vwxVERLeYPo9KMdb7fyjyfEQZBDbTE", "== <-", *retCh), "correct VaultAddress", *ackCh)
     }
   } |
 

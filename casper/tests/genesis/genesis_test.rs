@@ -568,7 +568,7 @@ async fn rev_vault_balance(node: &mut TestNode, shard_id: &str, rev_address: &st
 async fn genesis_from_input_files_should_parse_the_wallets_file_and_create_corresponding_rev_vaults(
 ) {
     // A known, valid rev address funded with a known non-zero balance in the wallets file.
-    const KNOWN_REV_ADDRESS: &str = "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP";
+    const KNOWN_REV_ADDRESS: &str = "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch";
     const KNOWN_BALANCE: u64 = 123_456_789;
 
     // Write and PARSE a wallets file (the behavior under test): `<rev_address>,<balance>` lines

@@ -745,15 +745,15 @@ Vault balance for a wallet address.
 
 | Parameter | Location | Required | Description |
 |-----------|----------|----------|-------------|
-| `address` | path | yes | REV wallet address (Base58-encoded, starts with `1111`) |
+| `address` | path | yes | REV wallet address (Base58-encoded, starts with `asi`) |
 | `block_hash` | query | no | Block hash to query against (defaults to LFB) |
 
 ```bash
-curl http://localhost:40453/api/balance/11112BpS5mG8...
+curl http://localhost:40453/api/balance/asi12BpS5mG8...
 ```
 
 ```json
-{"address": "11112BpS5mG8...", "balance": "1000000", "blockNumber": 42, "blockHash": "3bfdf56f..."}
+{"address": "asi12BpS5mG8...", "balance": "1000000", "blockNumber": 42, "blockHash": "3bfdf56f..."}
 ```
 
 | Status | Condition |

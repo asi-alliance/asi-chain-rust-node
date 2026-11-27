@@ -895,7 +895,7 @@ async fn uint256_fees_transfers_and_rewards_survive_peer_replay() {
     let mut nodes = TestNode::create_network(genesis.clone(), 2, None, None, None, None)
         .await
         .unwrap();
-    let recipient = "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP";
+    let recipient = "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch";
     let term = r#"
         new rl(`rho:registry:lookup`), systemCh, vaultCh, recipientCh, authCh, ret,
             deployerId(`rho:system:deployerId`), abort(`rho:execution:abort`) in {

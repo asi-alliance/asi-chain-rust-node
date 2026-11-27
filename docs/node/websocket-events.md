@@ -77,8 +77,8 @@ The `transfers-available` payload:
         "deploy-id": "def456...",
         "transfers": [
           {
-            "from-addr": "1111...",
-            "to-addr": "2222...",
+            "from-addr": "asi...",
+            "to-addr": "asi...",
             "amount": "1000000",
             "success": true
           }

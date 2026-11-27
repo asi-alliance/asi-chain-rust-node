@@ -138,7 +138,7 @@ mod tests {
     fn genesis_balances_cover_uint256_and_reject_invalid_amounts() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("wallets.txt");
-        let address = "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP";
+        let address = "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch";
         for value in [
             TokenAmount::zero(),
             1.into(),
@@ -163,7 +163,7 @@ mod tests {
     fn genesis_wallet_comments_preserve_exact_amounts() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("wallets.txt");
-        let address = "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP";
+        let address = "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch";
         fs::write(
             &path,
             format!(
@@ -191,7 +191,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let wallets_file = temp_dir.path().join("wallets.txt");
 
-        let wallets_content = "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP,50000000000000\n1111La6tHaCtGjRiv4wkffbTAAjGyMsVhzSUNzQxH1jjZH9jtEi3M,50000000000000\n";
+        let wallets_content = "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch,50000000000000\nasi781WRXQJETnWKyzRFcdF5hXxWctFCunvUYd6vM7MrMifb4qDA2n,50000000000000\n";
         fs::write(&wallets_file, wallets_content).unwrap();
 
         let result = VaultParser::parse(&wallets_file);
@@ -209,11 +209,11 @@ mod tests {
     fn a_repeated_wallet_address_is_refused() {
         let temp_dir = TempDir::new().unwrap();
         let wallets_file = temp_dir.path().join("wallets.txt");
-        let address = "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP";
+        let address = "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch";
         fs::write(
             &wallets_file,
             format!(
-                "{address},100\n1111La6tHaCtGjRiv4wkffbTAAjGyMsVhzSUNzQxH1jjZH9jtEi3M,100\n{address},200\n"
+                "{address},100\nasi781WRXQJETnWKyzRFcdF5hXxWctFCunvUYd6vM7MrMifb4qDA2n,100\n{address},200\n"
             ),
         )
         .unwrap();
@@ -274,7 +274,7 @@ mod tests {
 
         // Test with a simple pattern that should pass regex but fail balance parsing
         // Using a pattern similar to the working tests but with invalid balance
-        let invalid_content = "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP,abc\n";
+        let invalid_content = "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch,abc\n";
         fs::write(&wallets_file, invalid_content).unwrap();
 
         let result = VaultParser::parse(&wallets_file);
@@ -318,7 +318,7 @@ mod tests {
         let wallets_file = temp_dir.path().join("wallets.txt");
 
         let wallets_content =
-            "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP,50000000000000\n";
+            "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch,50000000000000\n";
         fs::write(&wallets_file, wallets_content).unwrap();
 
         let result = VaultParser::parse_from_path_str(wallets_file.to_str().unwrap());
@@ -345,7 +345,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let wallets_file = temp_dir.path().join("wallets.txt");
 
-        let wallets_content = "\n1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP,50000000000000\n\n   \n1111La6tHaCtGjRiv4wkffbTAAjGyMsVhzSUNzQxH1jjZH9jtEi3M,50000000000000\n\n";
+        let wallets_content = "\nasi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch,50000000000000\n\n   \nasi781WRXQJETnWKyzRFcdF5hXxWctFCunvUYd6vM7MrMifb4qDA2n,50000000000000\n\n";
         fs::write(&wallets_file, wallets_content).unwrap();
 
         let result = VaultParser::parse(&wallets_file);
@@ -361,7 +361,7 @@ mod tests {
         let wallets_file = temp_dir.path().join("wallets.txt");
 
         let wallets_content =
-            "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP,50000000000000\n";
+            "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch,50000000000000\n";
         fs::write(&wallets_file, wallets_content).unwrap();
 
         let result = VaultParser::parse(&wallets_file);
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(vault.initial_balance, 50_000_000_000_000u64.into());
         assert_eq!(
             vault.vault_address.to_base58(),
-            "1111LAd2PWaHsw84gxarNx99YVK2aZhCThhrPsWTV7cs1BPcvHftP"
+            "asi7816wfWEbsPi2KmJtiLXdPvH6NVT2cYdjvdz1rKTjVAZpxWK4ch"
         );
     }
 }
